@@ -1,9 +1,25 @@
+mod config;
+
+use std::{path::PathBuf, sync::Arc};
+
+use clap::Parser;
 use rmcp::{
     ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler,
     tool_router, transport::stdio,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::json;
+
+use crate::config::Config;
+
+#[derive(Parser)]
+#[command(about = "WIP MCP gateway")]
+struct Args {
+    /// Path to the config file, in the `mcpServers` format
+    #[arg(long, short)]
+    config: PathBuf,
+}
 
 #[allow(dead_code)]
 #[derive(Deserialize, JsonSchema)]
@@ -35,13 +51,27 @@ struct CallTool {
 }
 
 #[derive(Clone)]
-struct Gate;
+struct Gate {
+    config: Arc<Config>,
+}
 
 #[tool_router]
 impl Gate {
-    #[tool(description = "List the available MCP servers")]
+    #[tool(description = "List the configured MCP servers")]
     async fn list_mcp_servers(&self) -> String {
-        String::new()
+        let servers: Vec<_> = self
+            .config
+            .servers
+            .iter()
+            .map(|(id, server)| {
+                let mut entry = json!({ "serverId": id, "transport": server.transport.kind() });
+                if let Some(description) = &server.description {
+                    entry["description"] = description.as_str().into();
+                }
+                entry
+            })
+            .collect();
+        format!("{:#}", json!({ "servers": servers }))
     }
 
     #[tool(description = "Get the details of one or more tools from MCP servers")]
@@ -59,7 +89,9 @@ impl Gate {
 impl ServerHandler for Gate {}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Gate.serve(stdio()).await?.waiting().await?;
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let config = Arc::new(Config::load(&args.config)?);
+    Gate { config }.serve(stdio()).await?.waiting().await?;
     Ok(())
 }
