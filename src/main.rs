@@ -5,8 +5,11 @@ use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use rmcp::{
-    ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler,
-    tool_router, transport::stdio,
+    ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, JsonObject},
+    tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -43,7 +46,6 @@ struct GetToolDetails {
     tools: Vec<ToolRef>,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct CallTool {
@@ -52,7 +54,8 @@ struct CallTool {
     /// Name of the tool on that server
     tool_name: String,
     /// Arguments to pass to the tool
-    arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    arguments: JsonObject,
 }
 
 #[derive(Clone)]
@@ -100,8 +103,7 @@ impl Gate {
             return Err(format!("`tools` must have between 1 and {MAX_BATCH} items"));
         }
         let mut results = Vec::with_capacity(tools.len());
-        // Servers connect in the background, so waiting on each in turn only takes as long as
-        // the slowest one
+
         for ToolRef {
             server_id,
             tool_name,
@@ -121,8 +123,16 @@ impl Gate {
     }
 
     #[tool(description = "Call a tool on an MCP server")]
-    async fn call_mcp_tool(&self, Parameters(_): Parameters<CallTool>) -> String {
-        String::new()
+    async fn call_mcp_tool(
+        &self,
+        Parameters(CallTool {
+            server_id,
+            tool_name,
+            arguments,
+        }): Parameters<CallTool>,
+    ) -> Result<CallToolResult, String> {
+        // The server's result, including its own `isError`, is passed through as is
+        self.registry.call(&server_id, &tool_name, arguments).await
     }
 }
 

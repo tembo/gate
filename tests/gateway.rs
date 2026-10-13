@@ -327,3 +327,89 @@ async fn forwards_stderr_before_newlines() {
         assert_eq!(line, format!("[mcp:noisy] {}", "x".repeat(4096)));
     }
 }
+
+#[tokio::test]
+async fn forwards_calls() {
+    let url = serve_echo().await;
+    let gateway = Gateway::start(
+        json!({
+            "inner": nested_gate(),
+            "echo": { "url": url, "headers": { "Authorization": "Bearer ${TOKEN}" } },
+        }),
+        &[("TOKEN", "test-token")],
+    )
+    .await;
+
+    // Over HTTP, leaving out `arguments`
+    let output = gateway
+        .call(
+            "call_mcp_tool",
+            json!({ "serverId": "echo", "toolName": "echo" }),
+        )
+        .await;
+    assert_eq!(output, (json!("echo"), false));
+
+    // Over stdio, with arguments
+    let (output, is_error) = gateway
+        .call(
+            "call_mcp_tool",
+            json!({
+                "serverId": "inner",
+                "toolName": "get_mcp_tool_details",
+                "arguments": { "tools": [{ "serverId": "s", "toolName": "t" }] },
+            }),
+        )
+        .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(output["results"][0]["error"], "unknown server `s`");
+
+    // The server's own errors are passed through
+    let output = gateway
+        .call(
+            "call_mcp_tool",
+            json!({
+                "serverId": "inner",
+                "toolName": "get_mcp_tool_details",
+                "arguments": { "tools": [] },
+            }),
+        )
+        .await;
+    assert_eq!(
+        output,
+        (json!("`tools` must have between 1 and 20 items"), true)
+    );
+}
+
+#[tokio::test]
+async fn reports_call_errors() {
+    let gateway = Gateway::start(
+        json!({
+            "inner": nested_gate(),
+            "crashes": { "command": "sh", "args": ["-c", "exit 1"] },
+        }),
+        &[],
+    )
+    .await;
+    let call = |server_id: &str, tool_name: &str| {
+        let arguments = json!({ "serverId": server_id, "toolName": tool_name });
+        async { gateway.call("call_mcp_tool", arguments).await }
+    };
+
+    let (output, is_error) = call("missing", "t").await;
+    assert!(is_error);
+    assert_eq!(output, "unknown server `missing`");
+
+    let (output, is_error) = call("crashes", "t").await;
+    assert!(is_error);
+    let output = output.as_str().unwrap();
+    assert!(output.starts_with("server `crashes` failed"), "{output}");
+
+    // Tools aren't checked against the catalog, so the server reports unknown ones
+    let (output, is_error) = call("inner", "nope").await;
+    assert!(is_error);
+    let output = output.as_str().unwrap();
+    assert!(
+        output.starts_with("calling `nope` on `inner` failed"),
+        "{output}"
+    );
+}

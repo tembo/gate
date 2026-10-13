@@ -4,7 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use http::{HeaderName, HeaderValue};
 use rmcp::{
     RoleClient, ServiceExt,
-    model::{ClientConfig, Implementation, Tool},
+    model::{
+        CallToolRequestParams, CallToolResult, ClientConfig, Implementation, JsonObject, Tool,
+    },
     service::{Peer, RunningService},
     transport::{
         IntoTransport, StreamableHttpClientTransport, TokioChildProcess,
@@ -44,8 +46,6 @@ pub enum Status {
 }
 
 pub struct Connection {
-    // will eventually be used by `call_mcp_tool`
-    #[allow(dead_code)]
     pub peer: Peer<RoleClient>,
     pub tools: Vec<Tool>,
 }
@@ -76,6 +76,37 @@ impl Registry {
 
     /// Looks up a tool's definition, waiting for its server if it's still connecting
     pub async fn tool(&self, server_id: &str, tool_name: &str) -> Result<Tool, String> {
+        self.connection(server_id)
+            .await?
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .cloned()
+            .ok_or_else(|| format!("server `{server_id}` has no tool `{tool_name}`"))
+    }
+
+    /// Calls a tool, waiting for its server if it's still connecting
+    pub async fn call(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        arguments: JsonObject,
+    ) -> Result<CallToolResult, String> {
+        let params = CallToolRequestParams::new(tool_name.to_owned()).with_arguments(arguments);
+        self.connection(server_id)
+            .await?
+            .peer
+            .call_tool(params)
+            .await
+            .map_err(|error| {
+                redact_urls(&format!(
+                    "calling `{tool_name}` on `{server_id}` failed: {error}"
+                ))
+            })
+    }
+
+    /// Gets a server's connection, waiting for it if it's still connecting
+    async fn connection(&self, server_id: &str) -> Result<Arc<Connection>, String> {
         let mut status = self
             .servers
             .get(server_id)
@@ -87,12 +118,7 @@ impl Registry {
             .map_err(|_| format!("server `{server_id}` stopped connecting"))?
             .clone();
         match status {
-            Status::Ready(connection) => connection
-                .tools
-                .iter()
-                .find(|tool| tool.name == tool_name)
-                .cloned()
-                .ok_or_else(|| format!("server `{server_id}` has no tool `{tool_name}`")),
+            Status::Ready(connection) => Ok(connection),
             Status::Failed(error) => Err(format!("server `{server_id}` failed: {error}")),
             Status::Connecting => unreachable!("waited for the server to stop connecting"),
         }
