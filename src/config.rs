@@ -11,7 +11,7 @@ use serde::{
 };
 use url::Url;
 
-type ServerId = String;
+pub type ServerId = String;
 
 #[derive(Debug)]
 pub struct Config {
@@ -24,7 +24,7 @@ pub struct Server {
     pub transport: Transport,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Transport {
     Stdio {
         command: String,
@@ -35,10 +35,6 @@ pub enum Transport {
         url: String,
         headers: BTreeMap<String, String>,
     },
-    Sse {
-        url: String,
-        headers: BTreeMap<String, String>,
-    },
 }
 
 impl Transport {
@@ -46,7 +42,6 @@ impl Transport {
         match self {
             Transport::Stdio { .. } => Kind::Stdio,
             Transport::Http { .. } => Kind::Http,
-            Transport::Sse { .. } => Kind::Sse,
         }
     }
 }
@@ -57,7 +52,6 @@ impl Transport {
 pub enum Kind {
     Stdio,
     Http,
-    Sse,
 }
 
 impl fmt::Display for Kind {
@@ -65,7 +59,6 @@ impl fmt::Display for Kind {
         f.write_str(match self {
             Kind::Stdio => "stdio",
             Kind::Http => "http",
-            Kind::Sse => "sse",
         })
     }
 }
@@ -189,7 +182,7 @@ impl Server {
                 let env = expand_map("env", raw.env)?;
                 Transport::Stdio { command, args, env }
             }
-            Kind::Http | Kind::Sse => {
+            Kind::Http => {
                 reject(kind, "command", &raw.command)?;
                 reject(kind, "args", &raw.args)?;
                 reject(kind, "env", &raw.env)?;
@@ -200,11 +193,7 @@ impl Server {
                     bail!("`url` must be http or https");
                 }
                 let headers = expand_map("headers", raw.headers)?;
-                if kind == Kind::Http {
-                    Transport::Http { url, headers }
-                } else {
-                    Transport::Sse { url, headers }
-                }
+                Transport::Http { url, headers }
             }
         };
 
@@ -310,13 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn sse_needs_explicit_type() {
-        let server =
-            parse_one(serde_json::json!({ "type": "sse", "url": "http://localhost/sse" })).unwrap();
-        assert_eq!(server.transport.kind(), Kind::Sse);
-    }
-
-    #[test]
     fn ignores_unknown_fields() {
         let config = parse(
             r#"{ "other": 1, "mcpServers": { "s": { "command": "run", "disabled": false } } }"#,
@@ -366,10 +348,11 @@ mod tests {
 
     #[test]
     fn rejects_unknown_types() {
-        let error = parse(r#"{ "mcpServers": { "s": { "type": "ws", "url": "http://x" } } }"#)
+        // rmcp has no client for the deprecated SSE transport
+        let error = parse(r#"{ "mcpServers": { "s": { "type": "sse", "url": "http://x" } } }"#)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unknown variant `ws`"), "{error}");
+        assert!(error.contains("unknown variant `sse`"), "{error}");
     }
 
     #[test]
