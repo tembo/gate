@@ -3,11 +3,12 @@ use std::{collections::BTreeMap, collections::HashMap, process::Stdio, sync::Arc
 use anyhow::{Context, Result, anyhow};
 use http::{HeaderName, HeaderValue};
 use rmcp::{
-    RoleClient, ServiceExt,
+    RoleClient, ServiceError, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResult, ClientConfig, Implementation, JsonObject, Tool,
+        CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+        ClientConfig, ClientRequest, Implementation, JsonObject, ServerResult, Tool,
     },
-    service::{Peer, RunningService},
+    service::{Peer, PeerRequestOptions, RunningService},
     transport::{
         IntoTransport, StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -19,6 +20,7 @@ use tokio::{
     sync::watch,
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::config::{Config, ServerId, Transport};
@@ -52,11 +54,12 @@ pub struct Connection {
 
 pub struct Registry {
     servers: BTreeMap<ServerId, watch::Receiver<Status>>,
+    call_timeout: Duration,
 }
 
 impl Registry {
     /// Starts connecting to every configured server in the background
-    pub fn start(config: &Config) -> Self {
+    pub fn start(config: &Config, call_timeout: Duration) -> Self {
         let servers = config
             .servers
             .iter()
@@ -67,7 +70,10 @@ impl Registry {
             })
             .collect();
 
-        Self { servers }
+        Self {
+            servers,
+            call_timeout,
+        }
     }
 
     pub fn status(&self, server_id: &str) -> Option<Status> {
@@ -75,8 +81,13 @@ impl Registry {
     }
 
     /// Looks up a tool's definition, waiting for its server if it's still connecting
-    pub async fn tool(&self, server_id: &str, tool_name: &str) -> Result<Tool, String> {
-        self.connection(server_id)
+    pub async fn tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        ct: &CancellationToken,
+    ) -> Result<Tool, String> {
+        self.connection(server_id, ct)
             .await?
             .tools
             .iter()
@@ -85,38 +96,87 @@ impl Registry {
             .ok_or_else(|| format!("server `{server_id}` has no tool `{tool_name}`"))
     }
 
-    /// Calls a tool, waiting for its server if it's still connecting
+    /// Calls a tool, waiting for its server if it's still connecting.
+    ///
+    /// Timeouts and cancellation are passed on to the server, but only as requests: neither
+    /// guarantees that the server stopped, or that it undid what it had done.
     pub async fn call(
         &self,
         server_id: &str,
         tool_name: &str,
         arguments: JsonObject,
+        ct: &CancellationToken,
     ) -> Result<CallToolResult, String> {
+        let connection = self.connection(server_id, ct).await?;
+        let cancelled = || format!("calling `{tool_name}` on `{server_id}` was cancelled");
+        // The caller may have cancelled just as the server finished connecting
+        if ct.is_cancelled() {
+            return Err(cancelled());
+        }
+
+        let failed = |error| match error {
+            ServiceError::Timeout { timeout } => format!(
+                "calling `{tool_name}` on `{server_id}` timed out after {}s; the downstream outcome is unknown",
+                timeout.as_secs()
+            ),
+            // Transport errors can include the server's URL
+            error => redact_urls(&format!(
+                "calling `{tool_name}` on `{server_id}` failed: {error}"
+            )),
+        };
         let params = CallToolRequestParams::new(tool_name.to_owned()).with_arguments(arguments);
-        self.connection(server_id)
-            .await?
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        // When rmcp's timeout fires, it also tells the server to cancel the request
+        let request = connection
             .peer
-            .call_tool(params)
+            .send_request_with_option(request, PeerRequestOptions::with_timeout(self.call_timeout))
             .await
-            .map_err(|error| {
-                redact_urls(&format!(
-                    "calling `{tool_name}` on `{server_id}` failed: {error}"
-                ))
-            })
+            .map_err(failed)?;
+
+        let request_id = request.id.clone();
+        let response = tokio::select! {
+            biased;
+            response = request.await_response() => response.map_err(failed)?,
+            () = ct.cancelled() => {
+                let _ = connection
+                    .peer
+                    .notify_cancelled(CancelledNotificationParam::new(
+                        Some(request_id),
+                        Some("cancelled by the caller".into()),
+                    ))
+                    .await;
+                return Err(cancelled());
+            }
+        };
+        match response {
+            ServerResult::CallToolResult(result) => Ok(result),
+            _ => Err(format!(
+                "`{server_id}` sent an unexpected response to calling `{tool_name}`"
+            )),
+        }
     }
 
     /// Gets a server's connection, waiting for it if it's still connecting
-    async fn connection(&self, server_id: &str) -> Result<Arc<Connection>, String> {
+    async fn connection(
+        &self,
+        server_id: &str,
+        ct: &CancellationToken,
+    ) -> Result<Arc<Connection>, String> {
         let mut status = self
             .servers
             .get(server_id)
             .ok_or_else(|| format!("unknown server `{server_id}`"))?
             .clone();
-        let status = status
-            .wait_for(|status| !matches!(status, Status::Connecting))
-            .await
-            .map_err(|_| format!("server `{server_id}` stopped connecting"))?
-            .clone();
+        // Cancelling only stops this request from waiting. The connection attempt belongs to
+        // the server's task, and carries on for other requests.
+        let status = tokio::select! {
+            status = status.wait_for(|status| !matches!(status, Status::Connecting)) => status
+                .map_err(|_| format!("server `{server_id}` stopped connecting"))?
+                .clone(),
+            () = ct.cancelled() => {
+                return Err(format!("cancelled while waiting for `{server_id}` to connect"));
+            }
+        };
         match status {
             Status::Ready(connection) => Ok(connection),
             Status::Failed(error) => Err(format!("server `{server_id}` failed: {error}")),

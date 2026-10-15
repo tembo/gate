@@ -1,7 +1,7 @@
 mod config;
 mod registry;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use rmcp::{
@@ -14,6 +14,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Config,
@@ -28,6 +29,10 @@ struct Args {
     /// Path to the config file, in the `mcpServers` format
     #[arg(long, short)]
     config: PathBuf,
+
+    /// How long a tool call may take, in seconds
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    call_timeout: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -98,6 +103,7 @@ impl Gate {
     async fn get_mcp_tool_details(
         &self,
         Parameters(GetToolDetails { tools }): Parameters<GetToolDetails>,
+        ct: CancellationToken,
     ) -> Result<String, String> {
         if !(1..=MAX_BATCH).contains(&tools.len()) {
             return Err(format!("`tools` must have between 1 and {MAX_BATCH} items"));
@@ -109,15 +115,17 @@ impl Gate {
             tool_name,
         } in tools
         {
-            results.push(match self.registry.tool(&server_id, &tool_name).await {
-                Ok(mut tool) => {
-                    tool.icons = None;
-                    json!({ "serverId": server_id, "tool": tool })
-                }
-                Err(error) => {
-                    json!({ "serverId": server_id, "toolName": tool_name, "error": error })
-                }
-            });
+            results.push(
+                match self.registry.tool(&server_id, &tool_name, &ct).await {
+                    Ok(mut tool) => {
+                        tool.icons = None;
+                        json!({ "serverId": server_id, "tool": tool })
+                    }
+                    Err(error) => {
+                        json!({ "serverId": server_id, "toolName": tool_name, "error": error })
+                    }
+                },
+            );
         }
         Ok(json!({ "results": results }).to_string())
     }
@@ -130,9 +138,12 @@ impl Gate {
             tool_name,
             arguments,
         }): Parameters<CallTool>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, String> {
         // The server's result, including its own `isError`, is passed through as is
-        self.registry.call(&server_id, &tool_name, arguments).await
+        self.registry
+            .call(&server_id, &tool_name, arguments, &ct)
+            .await
     }
 }
 
@@ -143,7 +154,10 @@ impl ServerHandler for Gate {}
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Arc::new(Config::load(&args.config)?);
-    let registry = Arc::new(Registry::start(&config));
+    let registry = Arc::new(Registry::start(
+        &config,
+        Duration::from_secs(args.call_timeout),
+    ));
     Gate { config, registry }
         .serve(stdio())
         .await?

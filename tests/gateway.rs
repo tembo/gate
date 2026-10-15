@@ -3,15 +3,15 @@
 //! 2. in-process server over Streamable HTTP
 
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use rmcp::{
     RoleClient, ServerHandler, ServiceExt,
-    model::CallToolRequestParams,
-    service::RunningService,
+    model::{CallToolRequest, CallToolRequestParams, ClientRequest},
+    service::{PeerRequestOptions, RequestHandle, RunningService},
     tool, tool_handler, tool_router,
     transport::{
         TokioChildProcess,
@@ -19,15 +19,17 @@ use rmcp::{
     },
 };
 use serde_json::{Value, json};
-use std::{process::Stdio, time::Duration};
+use std::{process::Stdio, sync::Arc, time::Duration};
 use tempfile::TempDir;
 
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
     process::{ChildStderr, Command},
-    time::timeout,
+    sync::{Notify, watch},
+    time::{sleep, timeout},
 };
+use tokio_util::sync::CancellationToken;
 
 const GATE: &str = env!("CARGO_BIN_EXE_gate");
 
@@ -40,13 +42,14 @@ impl Gateway {
     /// Starts `gate` with these servers. `${EMPTY_CONFIG}` points at a config with no servers,
     /// for running `gate` itself as a downstream server
     async fn start(servers: Value, env: &[(&str, &str)]) -> Self {
-        Self::spawn(servers, env, Stdio::inherit()).await.0
+        Self::spawn(servers, env, &[], Stdio::inherit()).await.0
     }
 
-    /// Like `start`, with control over the gateway's stderr
+    /// Like `start`, with extra arguments and control over the gateway's stderr
     async fn spawn(
         servers: Value,
         env: &[(&str, &str)],
+        args: &[&str],
         stderr: Stdio,
     ) -> (Self, Option<ChildStderr>) {
         let dir = tempfile::tempdir().unwrap();
@@ -59,6 +62,7 @@ impl Gateway {
         command
             .arg("--config")
             .arg(&config)
+            .args(args)
             .env("EMPTY_CONFIG", &empty_config)
             .envs(env.iter().copied());
         let (transport, stderr) = TokioChildProcess::builder(command)
@@ -67,6 +71,17 @@ impl Gateway {
             .unwrap();
         let client = ().serve(transport).await.unwrap();
         (Self { client, _dir: dir }, stderr)
+    }
+
+    /// Starts calling a gateway tool without waiting for the result, so it can be cancelled
+    async fn start_call(&self, tool: &str, arguments: Value) -> RequestHandle<RoleClient> {
+        let params = CallToolRequestParams::new(tool.to_owned())
+            .with_arguments(arguments.as_object().unwrap().clone());
+        let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        self.client
+            .send_cancellable_request(request, PeerRequestOptions::no_options())
+            .await
+            .unwrap()
     }
 
     async fn call(&self, tool: &str, arguments: Value) -> (Value, bool) {
@@ -189,8 +204,18 @@ async fn limits_batch_size() {
     assert!(is_error);
 }
 
+/// What happened to `Echo`'s `sleep` tool. `Notify` keeps a permit when nobody is waiting, so
+/// tests can check for these after the fact.
+#[derive(Clone, Default)]
+struct Events {
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+}
+
 #[derive(Clone)]
-struct Echo;
+struct Echo {
+    events: Events,
+}
 
 #[tool_router]
 impl Echo {
@@ -198,13 +223,32 @@ impl Echo {
     async fn echo(&self) -> String {
         "echo".into()
     }
+
+    #[tool(description = "Sleeps until cancelled")]
+    async fn sleep(&self, ct: CancellationToken) -> String {
+        self.events.started.notify_one();
+        tokio::select! {
+            () = sleep(Duration::from_secs(30)) => "slept".into(),
+            () = ct.cancelled() => {
+                self.events.cancelled.notify_one();
+                "cancelled".into()
+            }
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for Echo {}
 
+struct EchoServer {
+    url: String,
+    events: Events,
+    /// Requests are held until this is `true`, to keep the gateway connecting
+    open: watch::Sender<bool>,
+}
+
 /// Serves `Echo` over Streamable HTTP, only to requests with `Authorization: Bearer test-token`
-async fn serve_echo() -> String {
+async fn serve_echo() -> EchoServer {
     async fn require_token(request: Request, next: Next) -> Response {
         let authorized = request
             .headers()
@@ -217,20 +261,48 @@ async fn serve_echo() -> String {
         }
     }
 
-    let service: StreamableHttpService<Echo, LocalSessionManager> =
-        StreamableHttpService::new(|| Ok(Echo), Default::default(), Default::default());
+    async fn hold(
+        State(mut open): State<watch::Receiver<bool>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let _ = open.wait_for(|open| *open).await;
+        next.run(request).await
+    }
+
+    let events = Events::default();
+    let (open, open_receiver) = watch::channel(true);
+    let service: StreamableHttpService<Echo, LocalSessionManager> = StreamableHttpService::new(
+        {
+            let events = events.clone();
+            move || {
+                Ok(Echo {
+                    events: events.clone(),
+                })
+            }
+        },
+        Default::default(),
+        Default::default(),
+    );
     let router = axum::Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn(require_token));
+        .layer(middleware::from_fn(require_token))
+        .layer(middleware::from_fn_with_state(open_receiver, hold));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router).await });
-    url
+    EchoServer { url, events, open }
 }
+
+fn echo(url: &str) -> Value {
+    json!({ "url": url, "headers": { "Authorization": "Bearer ${TOKEN}" } })
+}
+
+const TOKEN: (&str, &str) = ("TOKEN", "test-token");
 
 #[tokio::test]
 async fn discovers_http_tools_with_headers() {
-    let url = serve_echo().await;
+    let url = serve_echo().await.url;
     let gateway = Gateway::start(
         json!({
             "echo": { "url": url, "headers": { "Authorization": "Bearer ${TOKEN}" } },
@@ -253,7 +325,7 @@ async fn discovers_http_tools_with_headers() {
     let servers = gateway.servers().await;
     assert_eq!(servers[1]["serverId"], "echo");
     assert_eq!(servers[1]["transport"], "http");
-    assert_eq!(servers[1]["toolCount"], 1);
+    assert_eq!(servers[1]["toolCount"], 2);
 }
 
 #[tokio::test]
@@ -313,6 +385,7 @@ async fn forwards_stderr_before_newlines() {
             "args": ["-c", "head -c 10000 /dev/zero | tr '\\0' x >&2; sleep 10"],
         } }),
         &[],
+        &[],
         Stdio::piped(),
     )
     .await;
@@ -330,7 +403,7 @@ async fn forwards_stderr_before_newlines() {
 
 #[tokio::test]
 async fn forwards_calls() {
-    let url = serve_echo().await;
+    let url = serve_echo().await.url;
     let gateway = Gateway::start(
         json!({
             "inner": nested_gate(),
@@ -411,5 +484,89 @@ async fn reports_call_errors() {
     assert!(
         output.starts_with("calling `nope` on `inner` failed"),
         "{output}"
+    );
+}
+
+#[tokio::test]
+async fn times_out_calls() {
+    let server = serve_echo().await;
+    let (gateway, _) = Gateway::spawn(
+        json!({ "echo": echo(&server.url) }),
+        &[TOKEN],
+        &["--call-timeout", "1"],
+        Stdio::inherit(),
+    )
+    .await;
+
+    let output = gateway
+        .call(
+            "call_mcp_tool",
+            json!({ "serverId": "echo", "toolName": "sleep" }),
+        )
+        .await;
+    assert_eq!(
+        output,
+        (
+            json!(
+                "calling `sleep` on `echo` timed out after 1s; the downstream outcome is unknown"
+            ),
+            true
+        )
+    );
+    // rmcp tells the server to stop
+    timeout(Duration::from_secs(5), server.events.cancelled.notified())
+        .await
+        .expect("the timed out call should be cancelled downstream");
+}
+
+#[tokio::test]
+async fn forwards_cancellation() {
+    let server = serve_echo().await;
+    let gateway = Gateway::start(json!({ "echo": echo(&server.url) }), &[TOKEN]).await;
+
+    let call = gateway
+        .start_call(
+            "call_mcp_tool",
+            json!({ "serverId": "echo", "toolName": "sleep" }),
+        )
+        .await;
+    timeout(Duration::from_secs(5), server.events.started.notified())
+        .await
+        .expect("the call should reach the server");
+    call.cancel(None).await.unwrap();
+
+    timeout(Duration::from_secs(5), server.events.cancelled.notified())
+        .await
+        .expect("cancelling the call should cancel it downstream");
+}
+
+#[tokio::test]
+async fn cancelled_calls_are_not_dispatched_after_connecting() {
+    let server = serve_echo().await;
+    // Keeps the gateway connecting until the call is cancelled
+    server.open.send_replace(false);
+    let gateway = Gateway::start(json!({ "echo": echo(&server.url) }), &[TOKEN]).await;
+
+    let call = gateway
+        .start_call(
+            "call_mcp_tool",
+            json!({ "serverId": "echo", "toolName": "sleep" }),
+        )
+        .await;
+    // Gives the gateway time to start waiting for the connection
+    sleep(Duration::from_millis(300)).await;
+    call.cancel(None).await.unwrap();
+    server.open.send_replace(true);
+
+    // Waits for the connection, which other requests can still use
+    let results = gateway
+        .details(json!([{ "serverId": "echo", "toolName": "sleep" }]))
+        .await;
+    assert_eq!(results[0]["tool"]["name"], "sleep");
+    assert!(
+        timeout(Duration::from_secs(1), server.events.started.notified())
+            .await
+            .is_err(),
+        "the cancelled call shouldn't be dispatched"
     );
 }
