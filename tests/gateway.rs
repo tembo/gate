@@ -201,7 +201,7 @@ async fn discovers_stdio_tools() {
             "transport": "stdio",
             "description": "Nested",
             "status": "ready",
-            "toolCount": 4,
+            "toolCount": 5,
         }])
     );
 }
@@ -666,7 +666,7 @@ async fn retries_until_connected() {
     .await;
 
     let server = gateway.wait_for_status("flaky", "ready").await;
-    assert_eq!(server["toolCount"], 4);
+    assert_eq!(server["toolCount"], 5);
 }
 
 #[tokio::test]
@@ -837,7 +837,7 @@ async fn retries_failed_servers_on_request() {
     assert_eq!(results[0]["tool"]["name"], "list_mcp_servers");
     assert_eq!(
         gateway.wait_for_status("late", "ready").await["toolCount"],
-        4
+        5
     );
     assert_eq!(attempts(&attempts_file), "4");
 }
@@ -1032,7 +1032,7 @@ async fn searches_tools() {
     assert_eq!(found(&results[1]), ["inner/list_mcp_servers"]);
     assert_eq!(results[2], json!({ "error": "unknown server `nope`" }));
     let all = found(&results[3]);
-    assert_eq!(all.len(), 6);
+    assert_eq!(all.len(), 7);
     assert_eq!(all[..2], ["echo/echo", "echo/sleep"]);
     assert_eq!(results[3]["excludedServers"], json!([]));
 }
@@ -1126,4 +1126,157 @@ async fn limits_searches() {
             .await;
         assert!(is_error, "{searches}: {output}");
     }
+}
+
+impl Gateway {
+    /// Runs a script with `execute_mcp_code`, returning its output and whether it was an error
+    async fn run_code(&self, code: &str) -> (Value, bool) {
+        self.call("execute_mcp_code", json!({ "code": code })).await
+    }
+
+    /// Runs a script that should fail, returning its error
+    async fn code_error(&self, code: &str) -> String {
+        let (output, is_error) = self.run_code(code).await;
+        assert!(is_error, "{code}: {output}");
+        output.as_str().unwrap().to_owned()
+    }
+}
+
+#[tokio::test]
+async fn runs_code() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    let (output, is_error) = gateway
+        .run_code(
+            r#"
+            console.log("hi", { a: 1 }, [2]);
+            const sum = await Promise.resolve(1 + 1);
+            return { sum, text: "café 🦀" };
+            "#,
+        )
+        .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(
+        output,
+        json!({ "result": { "sum": 2, "text": "café 🦀" }, "logs": ["hi {\"a\":1} [2]"] })
+    );
+
+    assert_eq!(
+        gateway.run_code("let x = 1;").await,
+        (json!({ "result": null }), false)
+    );
+    // Each script runs in a fresh worker
+    gateway.run_code("globalThis.leftover = 1; return 1;").await;
+    let (output, _) = gateway.run_code("return typeof leftover;").await;
+    assert_eq!(output["result"], "undefined");
+}
+
+#[tokio::test]
+async fn warns_about_unhandled_rejections() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    let (output, is_error) = gateway
+        .run_code(r#"Promise.reject(new Error("lost")); return 1;"#)
+        .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(
+        output,
+        json!({ "result": 1, "warnings": ["unhandled rejection: lost"] })
+    );
+
+    // A rejection that gets a handler later isn't reported
+    let (output, _) = gateway
+        .run_code(
+            r#"
+            const p = Promise.reject(new Error("late"));
+            await null;
+            p.catch(() => {});
+            return 1;
+            "#,
+        )
+        .await;
+    assert_eq!(output, json!({ "result": 1 }));
+}
+
+#[tokio::test]
+async fn reports_script_errors() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    let cases = [
+        (r#"console.log("before"); throw new Error("boom");"#, "boom"),
+        ("return (", "unexpected token"),
+        ("const a = {}; a.self = a; return a;", "circular"),
+        ("return 1n;", "BigInt"),
+        ("return () => 1;", "isn't JSON-serializable"),
+        ("const f = () => f(); return f();", "stack"),
+        (r#"return "x".repeat(70000);"#, "over the 65536-byte limit"),
+        (
+            r#"for (;;) console.log("x".repeat(1000));"#,
+            "logged more than",
+        ),
+        (r#"await import("node:fs");"#, "node:fs"),
+    ];
+    for (code, expected) in cases {
+        let error = gateway.code_error(code).await;
+        assert!(error.contains(expected), "{code}: {error}");
+    }
+    // Empty log entries count against the limit too
+    let error = gateway
+        .code_error(r#"for (let i = 0; i < 100000; i++) console.log("");"#)
+        .await;
+    assert!(error.contains("logged more than"), "{error}");
+    // Failures stay within the output limit
+    for code in [
+        r#"throw new Error("x".repeat(100000));"#,
+        r#"for (let i = 0; i < 600; i++) console.log("y".repeat(100)); throw new Error("x".repeat(100000));"#,
+    ] {
+        let error = gateway.code_error(code).await;
+        assert!(error.len() <= 64 * 1024, "{code}: {} bytes", error.len());
+        assert!(error.contains("left out"), "{code}");
+    }
+    // What a failing script logged comes with its error
+    let error = gateway
+        .code_error(r#"console.log("before"); throw new Error("boom");"#)
+        .await;
+    assert!(error.ends_with("logs:\nbefore"), "{error}");
+
+    let error = gateway.code_error("  ").await;
+    assert_eq!(error, "`code` must not be empty");
+    let error = gateway.code_error(&"x".repeat(300 * 1024)).await;
+    assert!(error.contains("over the 262144-byte limit"), "{error}");
+}
+
+#[tokio::test]
+async fn limits_scripts() {
+    let (gateway, _) =
+        Gateway::spawn(json!({}), &[], &["--code-timeout", "1"], Stdio::inherit()).await;
+    let timed_out =
+        "the script timed out after 1s; tool calls it already made may have taken effect";
+    for code in ["while (true) {}", "await new Promise(() => {});"] {
+        let started = std::time::Instant::now();
+        assert_eq!(gateway.code_error(code).await, timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{code}: {:?}",
+            started.elapsed()
+        );
+    }
+
+    let error = gateway
+        .code_error("const a = []; while (true) a.push(new Array(100000).fill(1));")
+        .await;
+    assert!(error.contains("ran out of memory"), "{error}");
+    // And later scripts still run
+    assert_eq!(
+        gateway.run_code("return 42;").await,
+        (json!({ "result": 42 }), false)
+    );
+}
+
+#[tokio::test]
+async fn scripts_have_no_host_access() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    let (output, _) = gateway
+        .run_code(
+            "return [typeof process, typeof require, typeof fetch, typeof Bun, typeof Deno, typeof std, typeof os];",
+        )
+        .await;
+    assert_eq!(output["result"], json!(vec!["undefined"; 7]));
 }

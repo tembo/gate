@@ -1,6 +1,8 @@
+mod code;
 mod config;
 mod registry;
 mod search;
+mod spawn;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -18,6 +20,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    code::CodeRunner,
     config::Config,
     registry::{Registry, RetryDelays, Status},
     search::Index,
@@ -38,6 +41,10 @@ struct Args {
     /// How long a tool call may take, in seconds
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     call_timeout: u64,
+
+    /// How long a script run by `execute_mcp_code` may take, in seconds
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    code_timeout: u64,
 
     /// Milliseconds to wait before the second and third connection attempts. Hidden, since
     /// it's for tests that can't wait for the defaults.
@@ -109,10 +116,18 @@ struct CallTool {
     arguments: JsonObject,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct ExecuteCode {
+    /// The body of an async JavaScript function. Its return value, serialized as JSON, is
+    /// the result. Plain JavaScript only, not TypeScript.
+    code: String,
+}
+
 #[derive(Clone)]
 struct Gate {
     config: Arc<Config>,
     registry: Arc<Registry>,
+    code: CodeRunner,
 }
 
 #[tool_router]
@@ -236,13 +251,44 @@ impl Gate {
             .call(&server_id, &tool_name, arguments, &ct)
             .await
     }
+
+    #[tool(
+        description = "Run JavaScript, returning its result as JSON along with anything it logged"
+    )]
+    async fn execute_mcp_code(
+        &self,
+        Parameters(ExecuteCode { code }): Parameters<ExecuteCode>,
+        ct: CancellationToken,
+    ) -> Result<String, String> {
+        if code.trim().is_empty() {
+            return Err("`code` must not be empty".into());
+        }
+        if code.len() > code::MAX_SOURCE_BYTES {
+            return Err(format!(
+                "`code` is {} bytes, over the {}-byte limit",
+                code.len(),
+                code::MAX_SOURCE_BYTES
+            ));
+        }
+        self.code.run(code, &ct).await
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for Gate {}
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // `execute_mcp_code` runs each script in gate itself, started as a worker
+    if std::env::args().nth(1).as_deref() == Some(code::WORKER_FLAG) {
+        return code::worker::main();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Arc::new(Config::load(&args.config)?);
     let registry = Arc::new(Registry::start(
@@ -250,11 +296,18 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(args.call_timeout),
         args.retry_delays,
     ));
-    Gate { config, registry }
-        .serve(stdio())
-        .await?
-        .waiting()
-        .await?;
+    let executable = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("can't find gate's own executable: {error}"))?;
+    let code = CodeRunner::new(executable, Duration::from_secs(args.code_timeout));
+    Gate {
+        config,
+        registry,
+        code,
+    }
+    .serve(stdio())
+    .await?
+    .waiting()
+    .await?;
     Ok(())
 }
 

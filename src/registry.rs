@@ -32,6 +32,7 @@ use url::Url;
 use crate::{
     config::{Config, ServerId, Transport},
     search::{CatalogServer, ServerState},
+    spawn,
 };
 
 /// Max. time we'll spend waiting for a server to connect and list its tools
@@ -485,10 +486,14 @@ async fn connect(id: &str, transport: &Transport) -> Result<(Client, Vec<Tool>)>
             let mut cmd = Command::new(command);
             // The child inherits our environment, plus its own `env`
             cmd.args(args).envs(env).kill_on_drop(true);
-            let (child, stderr) = TokioChildProcess::builder(cmd)
-                .stderr(Stdio::piped())
-                .spawn()
-                .with_context(|| format!("failed to start `{command}`"))?;
+            let spawned = {
+                let _spawning = spawn::lock();
+                TokioChildProcess::builder(cmd)
+                    .stderr(Stdio::piped())
+                    .spawn()
+            };
+            let (child, stderr) =
+                spawned.with_context(|| format!("failed to start `{command}`"))?;
             let stderr = stderr.map(|stderr| tokio::spawn(forward_stderr(id.to_owned(), stderr)));
 
             match handshake(child).await {
