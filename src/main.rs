@@ -1,5 +1,6 @@
 mod config;
 mod registry;
+mod search;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -19,9 +20,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::Config,
     registry::{Registry, RetryDelays, Status},
+    search::Index,
 };
 
 const MAX_BATCH: usize = 20;
+/// The most matches one search returns, and how many it returns by default
+const MAX_SEARCH_RESULTS: usize = 50;
+const DEFAULT_SEARCH_RESULTS: usize = 20;
 
 #[derive(Parser)]
 #[command(about = "WIP MCP gateway")]
@@ -63,6 +68,26 @@ struct ToolRef {
     server_id: String,
     /// Name of the tool on that server
     tool_name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct Search {
+    /// Words to look for in server and tool names, titles, descriptions and parameters. Leave
+    /// out to list tools in order.
+    query: Option<String>,
+    /// Only search these servers. Leave out to search all of them.
+    server_ids: Option<Vec<String>>,
+    /// The most matches to return, from 1 to 50. Defaults to 20.
+    #[schemars(range(min = 1, max = MAX_SEARCH_RESULTS))]
+    max_results: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SearchMcpTools {
+    /// Searches to run, in a single batch
+    #[schemars(length(min = 1, max = MAX_BATCH))]
+    searches: Vec<Search>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -121,6 +146,41 @@ impl Gate {
             })
             .collect();
         json!({ "servers": servers }).to_string()
+    }
+
+    #[tool(description = "Search the tools of the connected MCP servers")]
+    async fn search_mcp_tools(
+        &self,
+        Parameters(SearchMcpTools { searches }): Parameters<SearchMcpTools>,
+    ) -> Result<String, String> {
+        if !(1..=MAX_BATCH).contains(&searches.len()) {
+            return Err(format!(
+                "`searches` must have between 1 and {MAX_BATCH} items"
+            ));
+        }
+        if searches.iter().any(|search| {
+            search
+                .max_results
+                .is_some_and(|max| !(1..=MAX_SEARCH_RESULTS).contains(&max))
+        }) {
+            return Err(format!(
+                "`maxResults` must be between 1 and {MAX_SEARCH_RESULTS}"
+            ));
+        }
+        // One index for the whole batch, so every search sees the same servers and tools
+        let index = Index::new(self.registry.catalog());
+        let results: Vec<_> = searches
+            .iter()
+            .map(|search| {
+                let query = search.query.as_deref().unwrap_or_default();
+                let max_results = search.max_results.unwrap_or(DEFAULT_SEARCH_RESULTS);
+                match index.search(query, search.server_ids.as_deref(), max_results) {
+                    Ok(results) => json!(results),
+                    Err(error) => json!({ "error": error }),
+                }
+            })
+            .collect();
+        Ok(json!({ "results": results }).to_string())
     }
 
     #[tool(description = "Get the details of one or more tools from MCP servers")]

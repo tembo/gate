@@ -29,7 +29,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::config::{Config, ServerId, Transport};
+use crate::{
+    config::{Config, ServerId, Transport},
+    search::{CatalogServer, ServerState},
+};
 
 /// Max. time we'll spend waiting for a server to connect and list its tools
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,10 +101,11 @@ impl Attempt {
 
 pub struct Connection {
     pub peer: Peer<RoleClient>,
-    pub tools: Vec<Tool>,
+    pub tools: Arc<[Tool]>,
 }
 
 struct ServerHandle {
+    description: Option<String>,
     status: Arc<watch::Sender<Status>>,
     /// Asks the server's task to make an attempt for a request, once the server has failed
     retry: mpsc::UnboundedSender<AttemptSender>,
@@ -156,7 +160,14 @@ impl Registry {
                 };
                 let first_attempt = first_attempt.map(|(permit, result, _)| (permit, result));
                 tokio::spawn(supervisor.run(first_attempt, retries));
-                (id.clone(), ServerHandle { status, retry })
+                (
+                    id.clone(),
+                    ServerHandle {
+                        description: server.description.clone(),
+                        status,
+                        retry,
+                    },
+                )
             })
             .collect();
 
@@ -166,6 +177,23 @@ impl Registry {
             background_permits,
             call_timeout,
         }
+    }
+
+    /// Captures each server's status once, for a batch of searches. Never waits for a
+    /// connection or starts a retry.
+    pub fn catalog(&self) -> Vec<CatalogServer> {
+        self.servers
+            .iter()
+            .map(|(id, server)| CatalogServer {
+                id: id.clone(),
+                description: server.description.clone(),
+                state: match &*server.status.borrow() {
+                    Status::Ready(connection) => ServerState::Ready(connection.tools.clone()),
+                    Status::Attempting(_) | Status::Pending => ServerState::Connecting,
+                    Status::Failed(error) => ServerState::Failed(error.clone()),
+                },
+            })
+            .collect()
     }
 
     pub fn status(&self, server_id: &str) -> Option<Status> {
@@ -439,6 +467,7 @@ impl Supervisor {
             .await
             .map_err(|error| format!("{error:#}"))?;
         let peer = client.peer().clone();
+        let tools = tools.into();
         Ok((client, Arc::new(Connection { peer, tools })))
     }
 
@@ -618,6 +647,7 @@ mod tests {
         let status = Arc::new(watch::Sender::new(Status::Pending));
         let (retry, retries) = mpsc::unbounded_channel();
         let server = ServerHandle {
+            description: None,
             status: status.clone(),
             retry,
         };

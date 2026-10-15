@@ -201,7 +201,7 @@ async fn discovers_stdio_tools() {
             "transport": "stdio",
             "description": "Nested",
             "status": "ready",
-            "toolCount": 3,
+            "toolCount": 4,
         }])
     );
 }
@@ -666,7 +666,7 @@ async fn retries_until_connected() {
     .await;
 
     let server = gateway.wait_for_status("flaky", "ready").await;
-    assert_eq!(server["toolCount"], 3);
+    assert_eq!(server["toolCount"], 4);
 }
 
 #[tokio::test]
@@ -837,7 +837,7 @@ async fn retries_failed_servers_on_request() {
     assert_eq!(results[0]["tool"]["name"], "list_mcp_servers");
     assert_eq!(
         gateway.wait_for_status("late", "ready").await["toolCount"],
-        3
+        4
     );
     assert_eq!(attempts(&attempts_file), "4");
 }
@@ -979,5 +979,151 @@ async fn batches_retry_servers_concurrently() {
     for result in output["results"].as_array().unwrap() {
         let error = result["error"].as_str().unwrap();
         assert!(error.contains("failed"), "{error}");
+    }
+}
+
+impl Gateway {
+    async fn search(&self, searches: Value) -> Vec<Value> {
+        let (output, is_error) = self
+            .call("search_mcp_tools", json!({ "searches": searches }))
+            .await;
+        assert!(!is_error, "{output}");
+        output["results"].as_array().unwrap().clone()
+    }
+}
+
+/// `server/tool` for each of a search result's matches
+fn found(result: &Value) -> Vec<String> {
+    result["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{result}"))
+        .iter()
+        .map(|found| {
+            format!(
+                "{}/{}",
+                found["serverId"].as_str().unwrap(),
+                found["toolName"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn searches_tools() {
+    let server = serve_echo().await;
+    let gateway = Gateway::start(
+        json!({ "echo": echo(&server.url), "inner": nested_gate() }),
+        &[TOKEN],
+    )
+    .await;
+    gateway.wait_for_status("echo", "ready").await;
+    gateway.wait_for_status("inner", "ready").await;
+
+    let results = gateway
+        .search(json!([
+            { "query": "echoes" },
+            { "query": "list servers", "serverIds": ["inner"], "maxResults": 1 },
+            { "query": "list", "serverIds": ["nope"] },
+            {},
+        ]))
+        .await;
+    assert_eq!(found(&results[0]), ["echo/echo"]);
+    assert_eq!(results[0]["matches"][0]["description"], "Echoes");
+    assert_eq!(found(&results[1]), ["inner/list_mcp_servers"]);
+    assert_eq!(results[2], json!({ "error": "unknown server `nope`" }));
+    let all = found(&results[3]);
+    assert_eq!(all.len(), 6);
+    assert_eq!(all[..2], ["echo/echo", "echo/sleep"]);
+    assert_eq!(results[3]["excludedServers"], json!([]));
+}
+
+#[tokio::test]
+async fn searching_never_connects() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts_file = dir.path().join("attempts");
+    let release = dir.path().join("release");
+    let gateway = Gateway::start(
+        json!({
+            "broken": script(&format!("{COUNTS_ATTEMPTS}; exit 1")),
+            "held": script(r#"while [ ! -e "$RELEASE" ]; do sleep 0.02; done; exit 1"#),
+        }),
+        &[
+            ("ATTEMPTS", attempts_file.to_str().unwrap()),
+            ("RELEASE", release.to_str().unwrap()),
+        ],
+    )
+    .await;
+    gateway.wait_for_status("broken", "failed").await;
+
+    let results = gateway.search(json!([{ "query": "anything" }])).await;
+    let excluded = results[0]["excludedServers"].as_array().unwrap();
+    assert_eq!(excluded[0]["serverId"], "broken");
+    assert_eq!(excluded[0]["status"], "failed");
+    assert!(excluded[0]["error"].is_string());
+    assert_eq!(
+        excluded[1],
+        json!({ "serverId": "held", "status": "connecting" })
+    );
+
+    // Unlike details and calls, searching doesn't retry failed servers
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(attempts(&attempts_file), "3");
+    std::fs::write(&release, "").unwrap();
+}
+
+#[tokio::test]
+async fn search_follows_reconnects() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let gateway = Gateway::start(
+        json!({ "inner": script(RECORDS_PID) }),
+        &[("PID_FILE", pid_file.to_str().unwrap())],
+    )
+    .await;
+    gateway.wait_for_status("inner", "ready").await;
+    let query = json!([{ "query": "list_mcp_servers", "maxResults": 1 }]);
+    assert_eq!(
+        found(&gateway.search(query.clone()).await[0]),
+        ["inner/list_mcp_servers"]
+    );
+
+    let first = std::fs::read_to_string(&pid_file).unwrap();
+    kill(&first);
+    // While reconnecting, the server is excluded rather than searched
+    let excluded = async {
+        loop {
+            let results = gateway.search(query.clone()).await;
+            if results[0]["excludedServers"].as_array().unwrap().len() == 1 {
+                return results[0].clone();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let result = timeout(Duration::from_secs(5), excluded).await.unwrap();
+    assert_eq!(result["matches"], json!([]));
+    assert_eq!(result["excludedServers"][0]["status"], "connecting");
+
+    wait_for_new_pid(&pid_file, &first).await;
+    gateway.wait_for_status("inner", "ready").await;
+    assert_eq!(
+        found(&gateway.search(query).await[0]),
+        ["inner/list_mcp_servers"]
+    );
+}
+
+#[tokio::test]
+async fn limits_searches() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    let invalid = [
+        json!([]),
+        json!(vec![json!({}); 21]),
+        json!([{ "maxResults": 0 }]),
+        json!([{ "maxResults": 51 }]),
+    ];
+    for searches in invalid {
+        let (output, is_error) = gateway
+            .call("search_mcp_tools", json!({ "searches": searches }))
+            .await;
+        assert!(is_error, "{searches}: {output}");
     }
 }

@@ -1,0 +1,170 @@
+{
+  "servers": [
+    {
+      "id": "filesystem",
+      "description": "Read and write local files",
+      "tools": [
+        {
+          "name": "read_file",
+          "description": "Read a file's contents",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Path of the file to read" }
+            }
+          }
+        },
+        {
+          "name": "move_file",
+          "description": "Move or rename a file",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "source": { "type": "string" },
+              "destination": { "type": "string", "description": "Where to move it" }
+            }
+          }
+        },
+        {
+          "name": "search_files",
+          "description": "Find files whose names match a pattern",
+          "inputSchema": {
+            "type": "object",
+            "properties": { "pattern": { "type": "string" } }
+          }
+        }
+      ]
+    },
+    {
+      "id": "github",
+      "description": "GitHub issues, pull requests and code",
+      "tools": [
+        {
+          "name": "search",
+          "title": "Search GitHub",
+          "description": "Search issues and pull requests",
+          "inputSchema": {
+            "type": "object",
+            "properties": { "query": { "type": "string" } }
+          }
+        },
+        {
+          "name": "get_issue",
+          "title": "Get issue",
+          "description": "Get an issue by its number",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "owner": { "type": "string" },
+              "repo": { "type": "string" },
+              "issueNumber": { "type": "number", "description": "The issue number" }
+            }
+          }
+        },
+        {
+          "name": "create_issue",
+          "title": "Create issue",
+          "description": "Create a new issue in a repository",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "owner": { "type": "string" },
+              "repo": { "type": "string" },
+              "title": { "type": "string" },
+              "body": { "type": "string" }
+            }
+          }
+        },
+        {
+          "name": "list_projects",
+          "description": "List the projects of an organization",
+          "inputSchema": {
+            "type": "object",
+            "properties": { "org": { "type": "string" } }
+          }
+        },
+        {
+          "name": "create_pull_request",
+          "title": "Create pull request",
+          "description": "Open a pull request",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "owner": { "type": "string" },
+              "repo": { "type": "string" },
+              "head": { "type": "string" },
+              "base": { "type": "string" }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "linear",
+      "description": "Linear issues and projects",
+      "tools": [
+        {
+          "name": "search",
+          "description": "Search Linear for issues, projects and documents",
+          "inputSchema": {
+            "type": "object",
+            "properties": { "query": { "type": "string" } }
+          }
+        },
+        {
+          "name": "get_issue",
+          "description": "Get a Linear issue by its identifier, such as ENG-123",
+          "inputSchema": {
+            "type": "object",
+            "properties": { "id": { "type": "string", "description": "Issue identifier" } }
+          }
+        },
+        {
+          "name": "create_issue",
+          "description": "Create a Linear issue in a team",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "teamId": { "type": "string" },
+              "title": { "type": "string" },
+              "description": { "type": "string", "description": "Markdown description" }
+            }
+          }
+        },
+        {
+          "name": "list_projects",
+          "description": "List projects in the workspace",
+          "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+          "name": "update_issue",
+          "description": "Change an issue's status, assignee or title",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "stateId": { "type": "string" },
+              "assigneeId": { "type": "string" }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "queries": [
+    { "query": "get_issue" },
+    { "query": "getIssue" },
+    { "query": "getissue" },
+    { "query": "github/get_issue" },
+    { "query": "linear issue" },
+    { "query": "create issue" },
+    { "query": "destination" },
+    { "query": "search" },
+    { "query": "search", "serverIds": ["linear"] },
+    { "query": "pull request" },
+    { "query": "rename file" },
+    { "query": "projects" },
+    { "query": "issue", "maxResults": 3 },
+    { "query": "" }
+  ]
+}
