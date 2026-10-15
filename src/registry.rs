@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{ChildStderr, Command},
     sync::watch,
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -40,11 +40,47 @@ const STDERR_TAIL_BYTES: usize = 4096;
 /// ```
 const STDERR_LINE_BYTES: usize = 4096;
 
+/// How long to wait before reconnecting to a server whose connection closed, like the
+/// original gateway. The retry delays then apply as usual.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// How long to wait before the second and third connection attempts
+pub type RetryDelays = [Duration; 2];
+
 #[derive(Clone)]
 pub enum Status {
-    Connecting,
+    /// An attempt is in progress. Requests wait for it.
+    Attempting(Attempt),
+    /// Waiting to retry or reconnect. Requests fail fast instead of waiting.
+    Pending,
     Ready(Arc<Connection>),
+    /// Every attempt failed
     Failed(Arc<str>),
+}
+
+type AttemptResult = Result<Arc<Connection>, Arc<str>>;
+/// Sets an attempt's result, once it's done
+type AttemptSender = watch::Sender<Option<AttemptResult>>;
+
+/// One connection attempt's result, shared by every request waiting on it. Each attempt has
+/// its own handle, so a request gets the result of the attempt it waited on, even if the
+/// server has moved on to later attempts by the time it looks.
+#[derive(Clone)]
+pub struct Attempt(watch::Receiver<Option<AttemptResult>>);
+
+impl Attempt {
+    fn new() -> (AttemptSender, Self) {
+        let (result, receiver) = watch::channel(None);
+        (result, Self(receiver))
+    }
+
+    async fn result(mut self) -> AttemptResult {
+        // The result is set once and never changes, so we can't miss it
+        match self.0.wait_for(Option::is_some).await {
+            Ok(result) => result.clone().expect("waited for the result"),
+            Err(_) => Err("the connection attempt was abandoned".into()),
+        }
+    }
 }
 
 pub struct Connection {
@@ -59,13 +95,22 @@ pub struct Registry {
 
 impl Registry {
     /// Starts connecting to every configured server in the background
-    pub fn start(config: &Config, call_timeout: Duration) -> Self {
+    pub fn start(config: &Config, call_timeout: Duration, retry_delays: RetryDelays) -> Self {
         let servers = config
             .servers
             .iter()
             .map(|(id, server)| {
-                let (status, receiver) = watch::channel(Status::Connecting);
-                tokio::spawn(run(id.clone(), server.transport.clone(), status));
+                // Starts with the first attempt in place, so requests wait for it from the start
+                let (first_attempt, attempt) = Attempt::new();
+                let (status, receiver) = watch::channel(Status::Attempting(attempt));
+                let transport = server.transport.clone();
+                tokio::spawn(supervise(
+                    id.clone(),
+                    transport,
+                    status,
+                    first_attempt,
+                    retry_delays,
+                ));
                 (id.clone(), receiver)
             })
             .collect();
@@ -156,54 +201,99 @@ impl Registry {
         }
     }
 
-    /// Gets a server's connection, waiting for it if it's still connecting
+    /// Gets a server's connection. If an attempt to connect is in progress, waits for that
+    /// attempt, but not for any retries after it.
     async fn connection(
         &self,
         server_id: &str,
         ct: &CancellationToken,
     ) -> Result<Arc<Connection>, String> {
-        let mut status = self
-            .servers
-            .get(server_id)
-            .ok_or_else(|| format!("unknown server `{server_id}`"))?
-            .clone();
-        // Cancelling only stops this request from waiting. The connection attempt belongs to
-        // the server's task, and carries on for other requests.
-        let status = tokio::select! {
-            status = status.wait_for(|status| !matches!(status, Status::Connecting)) => status
-                .map_err(|_| format!("server `{server_id}` stopped connecting"))?
-                .clone(),
-            () = ct.cancelled() => {
-                return Err(format!("cancelled while waiting for `{server_id}` to connect"));
-            }
+        let status = self
+            .status(server_id)
+            .ok_or_else(|| format!("unknown server `{server_id}`"))?;
+        let failed = |error| format!("server `{server_id}` failed: {error}");
+        let attempt = match status {
+            Status::Ready(connection) => return Ok(connection),
+            Status::Failed(error) => return Err(failed(error)),
+            Status::Pending => return Err(format!("server `{server_id}` is still connecting")),
+            Status::Attempting(attempt) => attempt,
         };
-        match status {
-            Status::Ready(connection) => Ok(connection),
-            Status::Failed(error) => Err(format!("server `{server_id}` failed: {error}")),
-            Status::Connecting => unreachable!("waited for the server to stop connecting"),
+        // Cancelling only stops this request from waiting. The attempt belongs to the server's
+        // task, and carries on for other requests.
+        tokio::select! {
+            result = attempt.result() => result.map_err(failed),
+            () = ct.cancelled() => {
+                Err(format!("cancelled while waiting for `{server_id}` to connect"))
+            }
         }
     }
 }
 
-/// Connects to a server and keeps its status up to date
-async fn run(id: ServerId, transport: Transport, status: watch::Sender<Status>) {
-    let (client, tools) = match connect(&id, &transport).await {
-        Ok(connected) => connected,
-        Err(error) => {
-            let error = format!("{error:#}");
-            eprintln!("[gate] failed to connect to `{id}`: {error}");
-            status.send_replace(Status::Failed(error.into()));
+/// Keeps a server connected, and its status up to date, for as long as the gateway runs
+async fn supervise(
+    id: ServerId,
+    transport: Transport,
+    status: watch::Sender<Status>,
+    first_attempt: AttemptSender,
+    retry_delays: RetryDelays,
+) {
+    let mut first_attempt = Some(first_attempt);
+    loop {
+        let connected =
+            connect_with_retries(&id, &transport, &status, first_attempt.take(), retry_delays);
+        let Some(client) = connected.await else {
             return;
-        }
-    };
-    status.send_replace(Status::Ready(Arc::new(Connection {
-        peer: client.peer().clone(),
-        tools,
-    })));
+        };
+        let _ = client.waiting().await;
+        eprintln!("[gate] connection to `{id}` closed; reconnecting in {RECONNECT_DELAY:?}");
+        status.send_replace(Status::Pending);
+        sleep(RECONNECT_DELAY).await;
+    }
+}
 
-    let _ = client.waiting().await;
-    eprintln!("[gate] connection to `{id}` closed");
-    status.send_replace(Status::Failed("connection closed".into()));
+/// Makes up to three attempts to connect, leaving the server `Ready` or `Failed`. Uses
+/// `first_attempt` for the first, if it's already in the server's status.
+async fn connect_with_retries(
+    id: &str,
+    transport: &Transport,
+    status: &watch::Sender<Status>,
+    mut first_attempt: Option<AttemptSender>,
+    [first_delay, second_delay]: RetryDelays,
+) -> Option<Client> {
+    let delays = [Some(first_delay), Some(second_delay), None];
+    for (attempt_number, retry_delay) in (1..).zip(delays) {
+        let result = first_attempt.take().unwrap_or_else(|| {
+            let (result, attempt) = Attempt::new();
+            status.send_replace(Status::Attempting(attempt));
+            result
+        });
+        let error = match connect(id, transport).await {
+            Ok((client, tools)) => {
+                let connection = Arc::new(Connection {
+                    peer: client.peer().clone(),
+                    tools,
+                });
+                result.send_replace(Some(Ok(connection.clone())));
+                status.send_replace(Status::Ready(connection));
+                return Some(client);
+            }
+            Err(error) => format!("{error:#}"),
+        };
+
+        let Some(retry_delay) = retry_delay else {
+            eprintln!("[gate] attempt {attempt_number}/3 to connect to `{id}` failed: {error}");
+            let error: Arc<str> = error.into();
+            result.send_replace(Some(Err(error.clone())));
+            status.send_replace(Status::Failed(error));
+            return None;
+        };
+        let error = format!("{error}; retrying in {retry_delay:?}");
+        eprintln!("[gate] attempt {attempt_number}/3 to connect to `{id}` failed: {error}");
+        result.send_replace(Some(Err(error.into())));
+        status.send_replace(Status::Pending);
+        sleep(retry_delay).await;
+    }
+    unreachable!("the last attempt either connects or fails")
 }
 
 type Client = RunningService<RoleClient, ClientConfig>;
@@ -365,6 +455,67 @@ fn forward_line(id: &str, line: &[u8], tail: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry with one server, `s`, whose status the test controls
+    fn registry() -> (Registry, watch::Sender<Status>) {
+        let (status, receiver) = watch::channel(Status::Pending);
+        let registry = Registry {
+            servers: BTreeMap::from([("s".to_owned(), receiver)]),
+            call_timeout: Duration::from_secs(1),
+        };
+        (registry, status)
+    }
+
+    #[tokio::test]
+    async fn requests_get_the_result_of_the_attempt_they_waited_on() {
+        let (registry, status) = registry();
+        let ct = CancellationToken::new();
+        let (first_result, first) = Attempt::new();
+        status.send_replace(Status::Attempting(first));
+
+        let mut request = std::pin::pin!(registry.connection("s", &ct));
+        // Polls the request once, so it starts waiting on the first attempt
+        assert!(timeout(Duration::ZERO, &mut request).await.is_err());
+
+        // The server moves through another attempt before the request looks
+        first_result.send_replace(Some(Err("first".into())));
+        status.send_replace(Status::Pending);
+        let (second_result, second) = Attempt::new();
+        status.send_replace(Status::Attempting(second));
+        second_result.send_replace(Some(Err("second".into())));
+        status.send_replace(Status::Failed("second".into()));
+
+        assert_eq!(request.await.err().unwrap(), "server `s` failed: first");
+    }
+
+    #[tokio::test]
+    async fn fails_fast_between_attempts() {
+        let (registry, _status) = registry();
+        let error = registry.connection("s", &CancellationToken::new()).await;
+        assert_eq!(error.err().unwrap(), "server `s` is still connecting");
+    }
+
+    #[tokio::test]
+    async fn cancelling_stops_waiting_but_not_the_attempt() {
+        let (registry, status) = registry();
+        let (result, attempt) = Attempt::new();
+        status.send_replace(Status::Attempting(attempt));
+
+        let ct = CancellationToken::new();
+        let mut cancelled = std::pin::pin!(registry.connection("s", &ct));
+        assert!(timeout(Duration::ZERO, &mut cancelled).await.is_err());
+        let other = CancellationToken::new();
+        let mut other = std::pin::pin!(registry.connection("s", &other));
+        assert!(timeout(Duration::ZERO, &mut other).await.is_err());
+
+        ct.cancel();
+        assert_eq!(
+            cancelled.await.err().unwrap(),
+            "cancelled while waiting for `s` to connect"
+        );
+        result.send_replace(Some(Err("refused".into())));
+        assert_eq!(other.await.err().unwrap(), "server `s` failed: refused");
+    }
 
     #[test]
     fn redacts_urls() {

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Config,
-    registry::{Registry, Status},
+    registry::{Registry, RetryDelays, Status},
 };
 
 const MAX_BATCH: usize = 20;
@@ -33,6 +33,27 @@ struct Args {
     /// How long a tool call may take, in seconds
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     call_timeout: u64,
+
+    /// Milliseconds to wait before the second and third connection attempts. Hidden, since
+    /// it's for tests that can't wait for the defaults.
+    #[arg(long, hide = true, default_value = "2000,10000", value_parser = parse_retry_delays)]
+    retry_delays: RetryDelays,
+}
+
+fn parse_retry_delays(text: &str) -> Result<RetryDelays, String> {
+    let delays: Vec<u64> = text
+        .split(',')
+        .map(|delay| {
+            delay
+                .trim()
+                .parse()
+                .map_err(|_| format!("invalid delay `{delay}`"))
+        })
+        .collect::<Result<_, _>>()?;
+    let [first, second] = delays[..] else {
+        return Err("expected two delays in milliseconds, like `2000,10000`".into());
+    };
+    Ok([Duration::from_millis(first), Duration::from_millis(second)])
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -83,7 +104,10 @@ impl Gate {
                     entry["description"] = description.as_str().into();
                 }
                 match self.registry.status(id) {
-                    Some(Status::Connecting) | None => entry["status"] = "connecting".into(),
+                    // Errors are only shown once every attempt has failed
+                    Some(Status::Attempting(_) | Status::Pending) | None => {
+                        entry["status"] = "connecting".into();
+                    }
                     Some(Status::Ready(connection)) => {
                         entry["status"] = "ready".into();
                         entry["toolCount"] = connection.tools.len().into();
@@ -157,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(Registry::start(
         &config,
         Duration::from_secs(args.call_timeout),
+        args.retry_delays,
     ));
     Gate { config, registry }
         .serve(stdio())
@@ -164,4 +189,20 @@ async fn main() -> anyhow::Result<()> {
         .waiting()
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_retry_delays() {
+        assert_eq!(
+            parse_retry_delays("2000, 10000"),
+            Ok([Duration::from_secs(2), Duration::from_secs(10)])
+        );
+        for invalid in ["", "2000", "1,2,3", "2000,soon", "-1,2"] {
+            assert!(parse_retry_delays(invalid).is_err(), "{invalid}");
+        }
+    }
 }

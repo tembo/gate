@@ -10,7 +10,7 @@ use axum::{
 };
 use rmcp::{
     RoleClient, ServerHandler, ServiceExt,
-    model::{CallToolRequest, CallToolRequestParams, ClientRequest},
+    model::{CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ServerResult},
     service::{PeerRequestOptions, RequestHandle, RunningService},
     tool, tool_handler, tool_router,
     transport::{
@@ -19,14 +19,14 @@ use rmcp::{
     },
 };
 use serde_json::{Value, json};
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{process::Stdio, time::Duration};
 use tempfile::TempDir;
 
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
     process::{ChildStderr, Command},
-    sync::{Notify, watch},
+    sync::{mpsc, watch},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -59,11 +59,14 @@ impl Gateway {
         std::fs::write(&empty_config, r#"{ "mcpServers": {} }"#).unwrap();
 
         let mut command = Command::new(GATE);
+        command.arg("--config").arg(&config).args(args);
+        // Retries quickly, so failing servers reach `failed` without slowing tests down
+        if !args.contains(&"--retry-delays") {
+            command.args(["--retry-delays", "10,10"]);
+        }
         command
-            .arg("--config")
-            .arg(&config)
-            .args(args)
             .env("EMPTY_CONFIG", &empty_config)
+            .env("GATE", GATE)
             .envs(env.iter().copied());
         let (transport, stderr) = TokioChildProcess::builder(command)
             .stderr(stderr)
@@ -87,10 +90,7 @@ impl Gateway {
     async fn call(&self, tool: &str, arguments: Value) -> (Value, bool) {
         let params = CallToolRequestParams::new(tool.to_owned())
             .with_arguments(arguments.as_object().unwrap().clone());
-        let result = self.client.call_tool(params).await.unwrap();
-        let text = result.content[0].as_text().unwrap().text.clone();
-        let output = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        (output, result.is_error == Some(true))
+        output(self.client.call_tool(params).await.unwrap())
     }
 
     async fn details(&self, tools: Value) -> Vec<Value> {
@@ -104,6 +104,73 @@ impl Gateway {
     async fn servers(&self) -> Value {
         self.call("list_mcp_servers", json!({})).await.0["servers"].clone()
     }
+
+    /// Polls `list_mcp_servers` until the server has this status, returning its entry
+    async fn wait_for_status(&self, server_id: &str, status: &str) -> Value {
+        let poll = async {
+            loop {
+                let servers = self.servers().await;
+                let server = servers
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|server| server["serverId"] == server_id)
+                    .unwrap()
+                    .clone();
+                if server["status"] == status {
+                    return server;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        };
+        timeout(Duration::from_secs(10), poll)
+            .await
+            .unwrap_or_else(|_| panic!("`{server_id}` should become {status}"))
+    }
+}
+
+/// Turns a gateway tool's result into its JSON output, and whether it was an error
+fn output(result: CallToolResult) -> (Value, bool) {
+    let text = result.content[0].as_text().unwrap().text.clone();
+    let output = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (output, result.is_error == Some(true))
+}
+
+/// Waits for a call started with `Gateway::start_call`
+async fn finish_call(call: RequestHandle<RoleClient>) -> (Value, bool) {
+    match call.await_response().await.unwrap() {
+        ServerResult::CallToolResult(result) => output(result),
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// A server that runs a shell script. The script sees the gateway's environment, including
+/// `$GATE` and `$EMPTY_CONFIG`.
+fn script(script: &str) -> Value {
+    json!({ "command": "sh", "args": ["-c", script] })
+}
+
+/// Waits for the server to write a PID to `pid_file` other than `old`
+async fn wait_for_new_pid(pid_file: &std::path::Path, old: &str) -> String {
+    let poll = async {
+        loop {
+            match std::fs::read_to_string(pid_file) {
+                Ok(pid) if pid != old => return pid,
+                _ => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    };
+    timeout(Duration::from_secs(10), poll)
+        .await
+        .expect("the server should restart")
+}
+
+fn kill(pid: &str) {
+    let status = std::process::Command::new("kill")
+        .args(["-9", pid.trim()])
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 fn nested_gate() -> Value {
@@ -150,6 +217,8 @@ async fn reports_failed_servers() {
         &[],
     )
     .await;
+    gateway.wait_for_status("crashes", "failed").await;
+    gateway.wait_for_status("missing", "failed").await;
 
     let results = gateway
         .details(json!([
@@ -204,17 +273,16 @@ async fn limits_batch_size() {
     assert!(is_error);
 }
 
-/// What happened to `Echo`'s `sleep` tool. `Notify` keeps a permit when nobody is waiting, so
-/// tests can check for these after the fact.
-#[derive(Clone, Default)]
-struct Events {
-    started: Arc<Notify>,
-    cancelled: Arc<Notify>,
+/// What happened to `Echo`'s `sleep` tool. Every event is kept, so tests can count them.
+#[derive(Debug, PartialEq)]
+enum Event {
+    Started,
+    Cancelled,
 }
 
 #[derive(Clone)]
 struct Echo {
-    events: Events,
+    events: mpsc::UnboundedSender<Event>,
 }
 
 #[tool_router]
@@ -226,11 +294,11 @@ impl Echo {
 
     #[tool(description = "Sleeps until cancelled")]
     async fn sleep(&self, ct: CancellationToken) -> String {
-        self.events.started.notify_one();
+        let _ = self.events.send(Event::Started);
         tokio::select! {
             () = sleep(Duration::from_secs(30)) => "slept".into(),
             () = ct.cancelled() => {
-                self.events.cancelled.notify_one();
+                let _ = self.events.send(Event::Cancelled);
                 "cancelled".into()
             }
         }
@@ -242,9 +310,27 @@ impl ServerHandler for Echo {}
 
 struct EchoServer {
     url: String,
-    events: Events,
+    events: mpsc::UnboundedReceiver<Event>,
     /// Requests are held until this is `true`, to keep the gateway connecting
     open: watch::Sender<bool>,
+}
+
+impl EchoServer {
+    async fn next_event(&mut self) -> Event {
+        timeout(Duration::from_secs(5), self.events.recv())
+            .await
+            .expect("`sleep` should report an event")
+            .unwrap()
+    }
+
+    /// Collects events until there's been none for a second
+    async fn remaining_events(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_secs(1), self.events.recv()).await {
+            events.push(event);
+        }
+        events
+    }
 }
 
 /// Serves `Echo` over Streamable HTTP, only to requests with `Authorization: Bearer test-token`
@@ -270,16 +356,13 @@ async fn serve_echo() -> EchoServer {
         next.run(request).await
     }
 
-    let events = Events::default();
+    let (sender, events) = mpsc::unbounded_channel();
     let (open, open_receiver) = watch::channel(true);
     let service: StreamableHttpService<Echo, LocalSessionManager> = StreamableHttpService::new(
-        {
-            let events = events.clone();
-            move || {
-                Ok(Echo {
-                    events: events.clone(),
-                })
-            }
+        move || {
+            Ok(Echo {
+                events: sender.clone(),
+            })
         },
         Default::default(),
         Default::default(),
@@ -311,6 +394,7 @@ async fn discovers_http_tools_with_headers() {
         &[("TOKEN", "test-token")],
     )
     .await;
+    gateway.wait_for_status("denied", "failed").await;
 
     let results = gateway
         .details(json!([
@@ -340,6 +424,8 @@ async fn connection_errors_hide_url_secrets() {
         &[("TOKEN", "hunter2")],
     )
     .await;
+    gateway.wait_for_status("query", "failed").await;
+    gateway.wait_for_status("userinfo", "failed").await;
 
     let results = gateway
         .details(json!([
@@ -366,6 +452,7 @@ async fn bounds_stderr_without_newlines() {
         &[],
     )
     .await;
+    gateway.wait_for_status("noisy", "failed").await;
 
     let results = gateway
         .details(json!([{ "serverId": "noisy", "toolName": "x" }]))
@@ -463,6 +550,7 @@ async fn reports_call_errors() {
         &[],
     )
     .await;
+    gateway.wait_for_status("crashes", "failed").await;
     let call = |server_id: &str, tool_name: &str| {
         let arguments = json!({ "serverId": server_id, "toolName": tool_name });
         async { gateway.call("call_mcp_tool", arguments).await }
@@ -489,7 +577,7 @@ async fn reports_call_errors() {
 
 #[tokio::test]
 async fn times_out_calls() {
-    let server = serve_echo().await;
+    let mut server = serve_echo().await;
     let (gateway, _) = Gateway::spawn(
         json!({ "echo": echo(&server.url) }),
         &[TOKEN],
@@ -514,14 +602,13 @@ async fn times_out_calls() {
         )
     );
     // rmcp tells the server to stop
-    timeout(Duration::from_secs(5), server.events.cancelled.notified())
-        .await
-        .expect("the timed out call should be cancelled downstream");
+    assert_eq!(server.next_event().await, Event::Started);
+    assert_eq!(server.next_event().await, Event::Cancelled);
 }
 
 #[tokio::test]
 async fn forwards_cancellation() {
-    let server = serve_echo().await;
+    let mut server = serve_echo().await;
     let gateway = Gateway::start(json!({ "echo": echo(&server.url) }), &[TOKEN]).await;
 
     let call = gateway
@@ -530,19 +617,14 @@ async fn forwards_cancellation() {
             json!({ "serverId": "echo", "toolName": "sleep" }),
         )
         .await;
-    timeout(Duration::from_secs(5), server.events.started.notified())
-        .await
-        .expect("the call should reach the server");
+    assert_eq!(server.next_event().await, Event::Started);
     call.cancel(None).await.unwrap();
-
-    timeout(Duration::from_secs(5), server.events.cancelled.notified())
-        .await
-        .expect("cancelling the call should cancel it downstream");
+    assert_eq!(server.next_event().await, Event::Cancelled);
 }
 
 #[tokio::test]
 async fn cancelled_calls_are_not_dispatched_after_connecting() {
-    let server = serve_echo().await;
+    let mut server = serve_echo().await;
     // Keeps the gateway connecting until the call is cancelled
     server.open.send_replace(false);
     let gateway = Gateway::start(json!({ "echo": echo(&server.url) }), &[TOKEN]).await;
@@ -563,10 +645,164 @@ async fn cancelled_calls_are_not_dispatched_after_connecting() {
         .details(json!([{ "serverId": "echo", "toolName": "sleep" }]))
         .await;
     assert_eq!(results[0]["tool"]["name"], "sleep");
-    assert!(
-        timeout(Duration::from_secs(1), server.events.started.notified())
-            .await
-            .is_err(),
+    assert_eq!(
+        server.remaining_events().await,
+        [],
         "the cancelled call shouldn't be dispatched"
     );
+}
+
+#[tokio::test]
+async fn retries_until_connected() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("failed-once");
+    let gateway = Gateway::start(
+        json!({ "flaky": script(r#"
+            if [ -e "$MARKER" ]; then exec "$GATE" --config "$EMPTY_CONFIG"; fi
+            touch "$MARKER"; exit 1
+        "#) }),
+        &[("MARKER", marker.to_str().unwrap())],
+    )
+    .await;
+
+    let server = gateway.wait_for_status("flaky", "ready").await;
+    assert_eq!(server["toolCount"], 3);
+}
+
+#[tokio::test]
+async fn waits_for_the_current_attempt_but_not_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
+    // Fails every attempt, but holds the first until the test releases it
+    let (gateway, _) = Gateway::spawn(
+        json!({ "held": script(r#"while [ ! -e "$RELEASE" ]; do sleep 0.02; done; exit 1"#) }),
+        &[("RELEASE", release.to_str().unwrap())],
+        &["--retry-delays", "10000,10000"],
+        Stdio::inherit(),
+    )
+    .await;
+
+    let waiting = gateway
+        .start_call(
+            "get_mcp_tool_details",
+            json!({ "tools": [{ "serverId": "held", "toolName": "x" }] }),
+        )
+        .await;
+    // A round trip after sending the request gets it to the gateway first. That doesn't prove
+    // it has started waiting, but if it hadn't, it'd get "still connecting" and fail below,
+    // rather than pass by accident.
+    gateway.servers().await;
+    std::fs::write(&release, "").unwrap();
+
+    let (output, _) = finish_call(waiting).await;
+    let error = output["results"][0]["error"].as_str().unwrap();
+    assert!(error.starts_with("server `held` failed: "), "{error}");
+    assert!(error.ends_with("; retrying in 10s"), "{error}");
+
+    // The server is waiting to retry, so new requests don't wait
+    let results = gateway
+        .details(json!([{ "serverId": "held", "toolName": "x" }]))
+        .await;
+    assert_eq!(results[0]["error"], "server `held` is still connecting");
+}
+
+#[tokio::test]
+async fn gives_up_after_three_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts = dir.path().join("attempts");
+    let gateway = Gateway::start(
+        json!({ "broken": script(r#"echo attempt >> "$ATTEMPTS"; exit 1"#) }),
+        &[("ATTEMPTS", attempts.to_str().unwrap())],
+    )
+    .await;
+
+    gateway.wait_for_status("broken", "failed").await;
+    // Nothing tries again after that
+    sleep(Duration::from_millis(200)).await;
+    let attempts = std::fs::read_to_string(&attempts).unwrap();
+    assert_eq!(attempts.lines().count(), 3);
+
+    let results = gateway
+        .details(json!([{ "serverId": "broken", "toolName": "x" }]))
+        .await;
+    let error = results[0]["error"].as_str().unwrap();
+    assert!(error.starts_with("server `broken` failed: "), "{error}");
+    assert!(!error.contains("retrying"), "{error}");
+}
+
+/// Writes the shell's PID, then becomes `gate`, with `$CONFIG` or no servers. `exec` keeps the
+/// PID, so killing it stops `gate` itself rather than leaving it running.
+const RECORDS_PID: &str =
+    r#"echo $$ > "$PID_FILE"; exec "$GATE" --config "${CONFIG:-$EMPTY_CONFIG}""#;
+
+#[tokio::test]
+async fn reconnects_when_a_connection_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let gateway = Gateway::start(
+        json!({ "inner": script(RECORDS_PID) }),
+        &[("PID_FILE", pid_file.to_str().unwrap())],
+    )
+    .await;
+    gateway.wait_for_status("inner", "ready").await;
+
+    let first = std::fs::read_to_string(&pid_file).unwrap();
+    kill(&first);
+    wait_for_new_pid(&pid_file, &first).await;
+
+    gateway.wait_for_status("inner", "ready").await;
+    let results = gateway
+        .details(json!([{ "serverId": "inner", "toolName": "list_mcp_servers" }]))
+        .await;
+    assert_eq!(results[0]["tool"]["name"], "list_mcp_servers");
+}
+
+#[tokio::test]
+async fn reconnecting_does_not_replay_calls() {
+    let mut server = serve_echo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let inner_config = dir.path().join("inner.json");
+    let inner_servers = json!({ "mcpServers": { "echo": echo(&server.url) } });
+    std::fs::write(&inner_config, inner_servers.to_string()).unwrap();
+    // The test calls `Echo` through two gateways, and kills the inner one mid-call
+    let gateway = Gateway::start(
+        json!({ "inner": script(RECORDS_PID) }),
+        &[
+            TOKEN,
+            ("PID_FILE", pid_file.to_str().unwrap()),
+            ("CONFIG", inner_config.to_str().unwrap()),
+        ],
+    )
+    .await;
+    gateway.wait_for_status("inner", "ready").await;
+    let through_inner = |tool_name: &str| {
+        json!({
+            "serverId": "inner",
+            "toolName": "call_mcp_tool",
+            "arguments": { "serverId": "echo", "toolName": tool_name },
+        })
+    };
+
+    let call = gateway
+        .start_call("call_mcp_tool", through_inner("sleep"))
+        .await;
+    assert_eq!(server.next_event().await, Event::Started);
+    let first = std::fs::read_to_string(&pid_file).unwrap();
+    kill(&first);
+
+    let (output, is_error) = finish_call(call).await;
+    assert!(is_error, "{output}");
+    let error = output.as_str().unwrap();
+    assert!(
+        error.starts_with("calling `call_mcp_tool` on `inner` failed"),
+        "{error}"
+    );
+
+    wait_for_new_pid(&pid_file, &first).await;
+    gateway.wait_for_status("inner", "ready").await;
+    let output = gateway.call("call_mcp_tool", through_inner("echo")).await;
+    assert_eq!(output, (json!("echo"), false));
+    let events = server.remaining_events().await;
+    assert!(!events.contains(&Event::Started), "{events:?}");
 }
