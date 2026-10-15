@@ -132,15 +132,22 @@ impl Gate {
         if !(1..=MAX_BATCH).contains(&tools.len()) {
             return Err(format!("`tools` must have between 1 and {MAX_BATCH} items"));
         }
-        let mut results = Vec::with_capacity(tools.len());
-
-        for ToolRef {
-            server_id,
-            tool_name,
-        } in tools
-        {
-            results.push(
-                match self.registry.tool(&server_id, &tool_name, &ct).await {
+        let lookups: Vec<_> = tools
+            .iter()
+            .map(|tool| (tool.server_id.as_str(), tool.tool_name.as_str()))
+            .collect();
+        let found = self.registry.tools(&lookups, &ct).await;
+        let results: Vec<_> = tools
+            .into_iter()
+            .zip(found)
+            .map(
+                |(
+                    ToolRef {
+                        server_id,
+                        tool_name,
+                    },
+                    found,
+                )| match found {
                     Ok(mut tool) => {
                         tool.icons = None;
                         json!({ "serverId": server_id, "tool": tool })
@@ -149,8 +156,8 @@ impl Gate {
                         json!({ "serverId": server_id, "toolName": tool_name, "error": error })
                     }
                 },
-            );
-        }
+            )
+            .collect();
         Ok(json!({ "results": results }).to_string())
     }
 

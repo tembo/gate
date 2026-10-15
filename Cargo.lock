@@ -521,6 +521,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "http",
  "rmcp",
  "schemars",

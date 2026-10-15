@@ -806,3 +806,178 @@ async fn reconnecting_does_not_replay_calls() {
     let events = server.remaining_events().await;
     assert!(!events.contains(&Event::Started), "{events:?}");
 }
+
+/// Counts attempts in `$ATTEMPTS`, leaving the attempt's number in `$n`
+const COUNTS_ATTEMPTS: &str =
+    r#"n=$(($(cat "$ATTEMPTS" 2>/dev/null || echo 0) + 1)); echo $n > "$ATTEMPTS""#;
+
+fn attempts(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap().trim().to_owned()
+}
+
+#[tokio::test]
+async fn retries_failed_servers_on_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts_file = dir.path().join("attempts");
+    // Fails the three background attempts, then works
+    let gateway = Gateway::start(
+        json!({ "late": script(&format!(r#"
+            {COUNTS_ATTEMPTS}
+            if [ $n -ge 4 ]; then exec "$GATE" --config "$EMPTY_CONFIG"; fi
+            exit 1
+        "#)) }),
+        &[("ATTEMPTS", attempts_file.to_str().unwrap())],
+    )
+    .await;
+    gateway.wait_for_status("late", "failed").await;
+
+    let results = gateway
+        .details(json!([{ "serverId": "late", "toolName": "list_mcp_servers" }]))
+        .await;
+    assert_eq!(results[0]["tool"]["name"], "list_mcp_servers");
+    assert_eq!(
+        gateway.wait_for_status("late", "ready").await["toolCount"],
+        3
+    );
+    assert_eq!(attempts(&attempts_file), "4");
+}
+
+#[tokio::test]
+async fn concurrent_requests_share_a_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts_file = dir.path().join("attempts");
+    let release = dir.path().join("release");
+    // Always fails, but holds attempts after the background ones until the test releases them
+    let gateway = Gateway::start(
+        json!({ "broken": script(&format!(r#"
+            {COUNTS_ATTEMPTS}
+            if [ $n -ge 4 ]; then
+                while [ ! -e "$RELEASE" ]; do sleep 0.02; done
+                echo "attempt $n failed" >&2
+            fi
+            exit 1
+        "#)) }),
+        &[
+            ("ATTEMPTS", attempts_file.to_str().unwrap()),
+            ("RELEASE", release.to_str().unwrap()),
+        ],
+    )
+    .await;
+    gateway.wait_for_status("broken", "failed").await;
+
+    let request = json!({ "tools": [{ "serverId": "broken", "toolName": "x" }] });
+    let first = gateway
+        .start_call("get_mcp_tool_details", request.clone())
+        .await;
+    let second = gateway.start_call("get_mcp_tool_details", request).await;
+    // Gets both requests to the gateway before the attempt fails. If either arrived later,
+    // it'd start its own attempt, and the count below would be off.
+    gateway.servers().await;
+    std::fs::write(&release, "").unwrap();
+
+    let (first, _) = finish_call(first).await;
+    let (second, _) = finish_call(second).await;
+    let error = first["results"][0]["error"].as_str().unwrap();
+    assert!(error.starts_with("server `broken` failed: "), "{error}");
+    assert!(error.contains("attempt 4 failed"), "{error}");
+    assert_eq!(first, second);
+    assert_eq!(attempts(&attempts_file), "4");
+    gateway.wait_for_status("broken", "failed").await;
+}
+
+#[tokio::test]
+async fn limits_background_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
+    let held = script(r#"while [ ! -e "$RELEASE" ]; do sleep 0.02; done; exit 1"#);
+    // The four held servers come first in config order, so they take every permit
+    let gateway = Gateway::start(
+        json!({
+            "a1": held, "a2": held, "a3": held, "a4": held,
+            "z": nested_gate(),
+        }),
+        &[("RELEASE", release.to_str().unwrap())],
+    )
+    .await;
+
+    // Queued for a permit, so requests fail fast
+    let results = gateway
+        .details(json!([{ "serverId": "z", "toolName": "list_mcp_servers" }]))
+        .await;
+    assert_eq!(results[0]["error"], "server `z` is still connecting");
+
+    std::fs::write(&release, "").unwrap();
+    gateway.wait_for_status("z", "ready").await;
+}
+
+#[tokio::test]
+async fn batches_retry_each_server_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let attempts_file = dir.path().join("attempts");
+    let gateway = Gateway::start(
+        json!({ "broken": script(&format!("{COUNTS_ATTEMPTS}; exit 1")) }),
+        &[("ATTEMPTS", attempts_file.to_str().unwrap())],
+    )
+    .await;
+    gateway.wait_for_status("broken", "failed").await;
+
+    let results = gateway
+        .details(json!([
+            { "serverId": "broken", "toolName": "a" },
+            { "serverId": "broken", "toolName": "b" },
+            { "serverId": "broken", "toolName": "c" },
+        ]))
+        .await;
+    assert_eq!(attempts(&attempts_file), "4");
+    assert_eq!(results[0]["error"], results[1]["error"]);
+    assert_eq!(results[1]["error"], results[2]["error"]);
+}
+
+#[tokio::test]
+async fn batches_retry_servers_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
+    // Each server holds its retry until the test releases them
+    let server = |name: &str| {
+        let attempts = dir.path().join(name);
+        script(&format!(
+            r#"ATTEMPTS="{}"; {COUNTS_ATTEMPTS}
+            if [ $n -ge 4 ]; then while [ ! -e "$RELEASE" ]; do sleep 0.02; done; fi
+            exit 1"#,
+            attempts.display()
+        ))
+    };
+    let gateway = Gateway::start(
+        json!({ "first": server("first"), "second": server("second") }),
+        &[("RELEASE", release.to_str().unwrap())],
+    )
+    .await;
+    gateway.wait_for_status("first", "failed").await;
+    gateway.wait_for_status("second", "failed").await;
+
+    let call = gateway
+        .start_call(
+            "get_mcp_tool_details",
+            json!({ "tools": [
+                { "serverId": "first", "toolName": "x" },
+                { "serverId": "second", "toolName": "x" },
+            ] }),
+        )
+        .await;
+    // Both retries start before either finishes
+    let both_started = async {
+        while ["first", "second"].map(|name| attempts(&dir.path().join(name))) != ["4", "4"] {
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    timeout(Duration::from_secs(10), both_started)
+        .await
+        .expect("both servers should retry at once");
+    std::fs::write(&release, "").unwrap();
+
+    let (output, _) = finish_call(call).await;
+    for result in output["results"].as_array().unwrap() {
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("failed"), "{error}");
+    }
+}

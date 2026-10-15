@@ -1,6 +1,12 @@
-use std::{collections::BTreeMap, collections::HashMap, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
+use futures::future::join_all;
 use http::{HeaderName, HeaderValue};
 use rmcp::{
     RoleClient, ServiceError, ServiceExt,
@@ -17,7 +23,7 @@ use rmcp::{
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{ChildStderr, Command},
-    sync::watch,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -47,14 +53,21 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// How long to wait before the second and third connection attempts
 pub type RetryDelays = [Duration; 2];
 
+/// The background connection concurrency limit: how many background attempts (at startup,
+/// retrying, or reconnecting) run at once, like the original gateway's four workers.
+/// Attempts made for a request skip it, and a server holds a permit only while attempting,
+/// not once connected.
+const MAX_BACKGROUND_ATTEMPTS: usize = 4;
+
 #[derive(Clone)]
 pub enum Status {
     /// An attempt is in progress. Requests wait for it.
     Attempting(Attempt),
-    /// Waiting to retry or reconnect. Requests fail fast instead of waiting.
+    /// Waiting to retry or reconnect, or for a background permit. Requests fail fast instead
+    /// of waiting.
     Pending,
     Ready(Arc<Connection>),
-    /// Every attempt failed
+    /// Every attempt failed. The next request that needs the server makes another.
     Failed(Arc<str>),
 }
 
@@ -88,57 +101,104 @@ pub struct Connection {
     pub tools: Vec<Tool>,
 }
 
+struct ServerHandle {
+    status: Arc<watch::Sender<Status>>,
+    /// Asks the server's task to make an attempt for a request, once the server has failed
+    retry: mpsc::UnboundedSender<AttemptSender>,
+}
+
 pub struct Registry {
-    servers: BTreeMap<ServerId, watch::Receiver<Status>>,
+    servers: BTreeMap<ServerId, ServerHandle>,
+    /// Lets tests hold every permit
+    #[cfg(test)]
+    background_permits: Arc<Semaphore>,
     call_timeout: Duration,
+}
+
+/// What a request does about a server, decided from its status
+enum Plan {
+    Use(Arc<Connection>),
+    Wait(Attempt),
+    Fail(String),
 }
 
 impl Registry {
     /// Starts connecting to every configured server in the background
     pub fn start(config: &Config, call_timeout: Duration, retry_delays: RetryDelays) -> Self {
+        let background_permits = Arc::new(Semaphore::new(MAX_BACKGROUND_ATTEMPTS));
         let servers = config
             .servers
             .iter()
             .map(|(id, server)| {
-                // Starts with the first attempt in place, so requests wait for it from the start
-                let (first_attempt, attempt) = Attempt::new();
-                let (status, receiver) = watch::channel(Status::Attempting(attempt));
-                let transport = server.transport.clone();
-                tokio::spawn(supervise(
-                    id.clone(),
-                    transport,
-                    status,
-                    first_attempt,
+                // Servers that get a permit now start with their first attempt in place, so
+                // requests wait for it from the start. The rest are queued.
+                let first_attempt =
+                    background_permits
+                        .clone()
+                        .try_acquire_owned()
+                        .ok()
+                        .map(|permit| {
+                            let (result, attempt) = Attempt::new();
+                            (permit, result, attempt)
+                        });
+                let status = match &first_attempt {
+                    Some((_, _, attempt)) => Status::Attempting(attempt.clone()),
+                    None => Status::Pending,
+                };
+                let status = Arc::new(watch::Sender::new(status));
+                let (retry, retries) = mpsc::unbounded_channel();
+                let supervisor = Supervisor {
+                    id: id.clone(),
+                    transport: server.transport.clone(),
+                    status: status.clone(),
                     retry_delays,
-                ));
-                (id.clone(), receiver)
+                    background_permits: background_permits.clone(),
+                };
+                let first_attempt = first_attempt.map(|(permit, result, _)| (permit, result));
+                tokio::spawn(supervisor.run(first_attempt, retries));
+                (id.clone(), ServerHandle { status, retry })
             })
             .collect();
 
         Self {
             servers,
+            #[cfg(test)]
+            background_permits,
             call_timeout,
         }
     }
 
     pub fn status(&self, server_id: &str) -> Option<Status> {
-        Some(self.servers.get(server_id)?.borrow().clone())
+        Some(self.servers.get(server_id)?.status.borrow().clone())
     }
 
-    /// Looks up a tool's definition, waiting for its server if it's still connecting
-    pub async fn tool(
+    /// Looks up tools' definitions as `(server_id, tool_name)` pairs, returning results in
+    /// the same order.
+    ///
+    /// Gets each server's connection once, and every server's at the same time, like the
+    /// original gateway. Getting them per tool would make a failed server retry once for each
+    /// of its tools, one after another.
+    pub async fn tools(
         &self,
-        server_id: &str,
-        tool_name: &str,
+        tools: &[(&str, &str)],
         ct: &CancellationToken,
-    ) -> Result<Tool, String> {
-        self.connection(server_id, ct)
-            .await?
-            .tools
+    ) -> Vec<Result<Tool, String>> {
+        let server_ids: BTreeSet<&str> = tools.iter().map(|&(server_id, _)| server_id).collect();
+        let connections = join_all(server_ids.iter().map(|id| self.connection(id, ct))).await;
+        let connections: HashMap<_, _> = server_ids.into_iter().zip(connections).collect();
+        tools
             .iter()
-            .find(|tool| tool.name == tool_name)
-            .cloned()
-            .ok_or_else(|| format!("server `{server_id}` has no tool `{tool_name}`"))
+            .map(|&(server_id, tool_name)| {
+                connections[server_id]
+                    .as_ref()
+                    .map_err(Clone::clone)?
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == tool_name)
+                    .cloned()
+                    .ok_or_else(|| format!("server `{server_id}` has no tool `{tool_name}`"))
+            })
+            .collect()
     }
 
     /// Calls a tool, waiting for its server if it's still connecting.
@@ -202,21 +262,61 @@ impl Registry {
     }
 
     /// Gets a server's connection. If an attempt to connect is in progress, waits for that
-    /// attempt, but not for any retries after it.
+    /// attempt, but not for any retries after it. If the server has failed, makes one more
+    /// attempt and waits for it.
     async fn connection(
         &self,
         server_id: &str,
         ct: &CancellationToken,
     ) -> Result<Arc<Connection>, String> {
-        let status = self
-            .status(server_id)
+        let server = self
+            .servers
+            .get(server_id)
             .ok_or_else(|| format!("unknown server `{server_id}`"))?;
         let failed = |error| format!("server `{server_id}` failed: {error}");
-        let attempt = match status {
-            Status::Ready(connection) => return Ok(connection),
-            Status::Failed(error) => return Err(failed(error)),
-            Status::Pending => return Err(format!("server `{server_id}` is still connecting")),
-            Status::Attempting(attempt) => attempt,
+
+        // Decides what to do and captures what to wait on in one step, so the server can't
+        // change status in between. Otherwise, an attempt that failed quickly could make this
+        // request start another.
+        let mut plan = None;
+        server.status.send_if_modified(|status| {
+            let (next, modified) = match status {
+                Status::Ready(connection) => (Plan::Use(connection.clone()), false),
+                Status::Attempting(attempt) => (Plan::Wait(attempt.clone()), false),
+                Status::Pending => (
+                    Plan::Fail(format!("server `{server_id}` is still connecting")),
+                    false,
+                ),
+                Status::Failed(error) if ct.is_cancelled() => {
+                    (Plan::Fail(failed(error.clone())), false)
+                }
+                Status::Failed(_) => {
+                    let (result, attempt) = Attempt::new();
+                    // Hands the attempt to the server's task before publishing it, so the
+                    // server can't be left `Attempting` with nobody making the attempt. The
+                    // task can't change the status until this closure returns.
+                    match server.retry.send(result) {
+                        Ok(()) => {
+                            *status = Status::Attempting(attempt.clone());
+                            (Plan::Wait(attempt), true)
+                        }
+                        Err(_) => (
+                            Plan::Fail(format!(
+                                "server `{server_id}` can't retry: its task stopped"
+                            )),
+                            false,
+                        ),
+                    }
+                }
+            };
+            plan = Some(next);
+            modified
+        });
+
+        let attempt = match plan.expect("decided while checking the status") {
+            Plan::Use(connection) => return Ok(connection),
+            Plan::Fail(error) => return Err(error),
+            Plan::Wait(attempt) => attempt,
         };
         // Cancelling only stops this request from waiting. The attempt belongs to the server's
         // task, and carries on for other requests.
@@ -229,71 +329,123 @@ impl Registry {
     }
 }
 
+/// A background permit, and the result sender for the attempt it was taken for
+type FirstAttempt = (OwnedSemaphorePermit, AttemptSender);
+
 /// Keeps a server connected, and its status up to date, for as long as the gateway runs
-async fn supervise(
+struct Supervisor {
     id: ServerId,
     transport: Transport,
-    status: watch::Sender<Status>,
-    first_attempt: AttemptSender,
+    status: Arc<watch::Sender<Status>>,
     retry_delays: RetryDelays,
-) {
-    let mut first_attempt = Some(first_attempt);
-    loop {
-        let connected =
-            connect_with_retries(&id, &transport, &status, first_attempt.take(), retry_delays);
-        let Some(client) = connected.await else {
-            return;
-        };
-        let _ = client.waiting().await;
-        eprintln!("[gate] connection to `{id}` closed; reconnecting in {RECONNECT_DELAY:?}");
-        status.send_replace(Status::Pending);
-        sleep(RECONNECT_DELAY).await;
-    }
+    background_permits: Arc<Semaphore>,
 }
 
-/// Makes up to three attempts to connect, leaving the server `Ready` or `Failed`. Uses
-/// `first_attempt` for the first, if it's already in the server's status.
-async fn connect_with_retries(
-    id: &str,
-    transport: &Transport,
-    status: &watch::Sender<Status>,
-    mut first_attempt: Option<AttemptSender>,
-    [first_delay, second_delay]: RetryDelays,
-) -> Option<Client> {
-    let delays = [Some(first_delay), Some(second_delay), None];
-    for (attempt_number, retry_delay) in (1..).zip(delays) {
-        let result = first_attempt.take().unwrap_or_else(|| {
-            let (result, attempt) = Attempt::new();
-            status.send_replace(Status::Attempting(attempt));
-            result
-        });
-        let error = match connect(id, transport).await {
-            Ok((client, tools)) => {
-                let connection = Arc::new(Connection {
-                    peer: client.peer().clone(),
-                    tools,
-                });
-                result.send_replace(Some(Ok(connection.clone())));
-                status.send_replace(Status::Ready(connection));
-                return Some(client);
-            }
-            Err(error) => format!("{error:#}"),
-        };
-
-        let Some(retry_delay) = retry_delay else {
-            eprintln!("[gate] attempt {attempt_number}/3 to connect to `{id}` failed: {error}");
-            let error: Arc<str> = error.into();
-            result.send_replace(Some(Err(error.clone())));
-            status.send_replace(Status::Failed(error));
-            return None;
-        };
-        let error = format!("{error}; retrying in {retry_delay:?}");
-        eprintln!("[gate] attempt {attempt_number}/3 to connect to `{id}` failed: {error}");
-        result.send_replace(Some(Err(error.into())));
-        status.send_replace(Status::Pending);
-        sleep(retry_delay).await;
+impl Supervisor {
+    /// Unlike the original gateway, which retried servers in rounds (finishing every first
+    /// attempt before the first delay, and so on), each server retries on its own schedule.
+    async fn run(
+        self,
+        mut first_attempt: Option<FirstAttempt>,
+        mut retries: mpsc::UnboundedReceiver<AttemptSender>,
+    ) {
+        loop {
+            let client = match self.connect_with_retries(first_attempt.take()).await {
+                Some(client) => client,
+                // Once failed, makes one attempt each time a request asks for one, until one
+                // connects
+                None => loop {
+                    let Some(result) = retries.recv().await else {
+                        return;
+                    };
+                    eprintln!("[gate] retrying `{}` for a request", self.id);
+                    match self.connect().await {
+                        Ok((client, connection)) => {
+                            self.ready(result, connection);
+                            break client;
+                        }
+                        Err(error) => {
+                            eprintln!("[gate] retrying `{}` failed: {error}", self.id);
+                            let error: Arc<str> = error.into();
+                            result.send_replace(Some(Err(error.clone())));
+                            self.status.send_replace(Status::Failed(error));
+                        }
+                    }
+                },
+            };
+            let _ = client.waiting().await;
+            eprintln!(
+                "[gate] connection to `{}` closed; reconnecting in {RECONNECT_DELAY:?}",
+                self.id
+            );
+            self.status.send_replace(Status::Pending);
+            sleep(RECONNECT_DELAY).await;
+        }
     }
-    unreachable!("the last attempt either connects or fails")
+
+    /// Makes up to three background attempts, leaving the server `Ready` or `Failed`. Uses
+    /// `first_attempt` for the first, if it's already in the server's status.
+    async fn connect_with_retries(
+        &self,
+        mut first_attempt: Option<FirstAttempt>,
+    ) -> Option<Client> {
+        let [first_delay, second_delay] = self.retry_delays;
+        let delays = [Some(first_delay), Some(second_delay), None];
+        for (attempt_number, retry_delay) in (1..).zip(delays) {
+            let (permit, result) = match first_attempt.take() {
+                Some(first_attempt) => first_attempt,
+                None => {
+                    // The server stays `Pending` while it waits for a permit
+                    let permit = self
+                        .background_permits
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("the semaphore is never closed");
+                    let (result, attempt) = Attempt::new();
+                    self.status.send_replace(Status::Attempting(attempt));
+                    (permit, result)
+                }
+            };
+            let connected = self.connect().await;
+            drop(permit);
+            let error = match connected {
+                Ok((client, connection)) => {
+                    self.ready(result, connection);
+                    return Some(client);
+                }
+                Err(error) => error,
+            };
+
+            let id = &self.id;
+            let Some(retry_delay) = retry_delay else {
+                eprintln!("[gate] attempt {attempt_number}/3 to connect to `{id}` failed: {error}");
+                let error: Arc<str> = error.into();
+                result.send_replace(Some(Err(error.clone())));
+                self.status.send_replace(Status::Failed(error));
+                return None;
+            };
+            let error = format!("{error}; retrying in {retry_delay:?}");
+            eprintln!("[gate] attempt {attempt_number}/3 to connect to `{id}` failed: {error}");
+            result.send_replace(Some(Err(error.into())));
+            self.status.send_replace(Status::Pending);
+            sleep(retry_delay).await;
+        }
+        unreachable!("the last attempt either connects or fails")
+    }
+
+    async fn connect(&self) -> Result<(Client, Arc<Connection>), String> {
+        let (client, tools) = connect(&self.id, &self.transport)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        let peer = client.peer().clone();
+        Ok((client, Arc::new(Connection { peer, tools })))
+    }
+
+    fn ready(&self, result: AttemptSender, connection: Arc<Connection>) {
+        result.send_replace(Some(Ok(connection.clone())));
+        self.status.send_replace(Status::Ready(connection));
+    }
 }
 
 type Client = RunningService<RoleClient, ClientConfig>;
@@ -456,19 +608,30 @@ fn forward_line(id: &str, line: &[u8], tail: &mut String) {
 mod tests {
     use super::*;
 
-    /// A registry with one server, `s`, whose status the test controls
-    fn registry() -> (Registry, watch::Sender<Status>) {
-        let (status, receiver) = watch::channel(Status::Pending);
+    /// A registry with one server, `s`, whose status the test controls. Its retry requests
+    /// arrive on the returned receiver.
+    fn registry() -> (
+        Registry,
+        Arc<watch::Sender<Status>>,
+        mpsc::UnboundedReceiver<AttemptSender>,
+    ) {
+        let status = Arc::new(watch::Sender::new(Status::Pending));
+        let (retry, retries) = mpsc::unbounded_channel();
+        let server = ServerHandle {
+            status: status.clone(),
+            retry,
+        };
         let registry = Registry {
-            servers: BTreeMap::from([("s".to_owned(), receiver)]),
+            servers: BTreeMap::from([("s".to_owned(), server)]),
+            background_permits: Arc::new(Semaphore::new(MAX_BACKGROUND_ATTEMPTS)),
             call_timeout: Duration::from_secs(1),
         };
-        (registry, status)
+        (registry, status, retries)
     }
 
     #[tokio::test]
     async fn requests_get_the_result_of_the_attempt_they_waited_on() {
-        let (registry, status) = registry();
+        let (registry, status, _retries) = registry();
         let ct = CancellationToken::new();
         let (first_result, first) = Attempt::new();
         status.send_replace(Status::Attempting(first));
@@ -490,14 +653,14 @@ mod tests {
 
     #[tokio::test]
     async fn fails_fast_between_attempts() {
-        let (registry, _status) = registry();
+        let (registry, _status, _retries) = registry();
         let error = registry.connection("s", &CancellationToken::new()).await;
         assert_eq!(error.err().unwrap(), "server `s` is still connecting");
     }
 
     #[tokio::test]
     async fn cancelling_stops_waiting_but_not_the_attempt() {
-        let (registry, status) = registry();
+        let (registry, status, _retries) = registry();
         let (result, attempt) = Attempt::new();
         status.send_replace(Status::Attempting(attempt));
 
@@ -515,6 +678,93 @@ mod tests {
         );
         result.send_replace(Some(Err("refused".into())));
         assert_eq!(other.await.err().unwrap(), "server `s` failed: refused");
+    }
+
+    #[tokio::test]
+    async fn retries_failed_servers_on_request() {
+        let (registry, status, mut retries) = registry();
+        status.send_replace(Status::Failed("old".into()));
+        let ct = CancellationToken::new();
+
+        let mut first = std::pin::pin!(registry.connection("s", &ct));
+        assert!(timeout(Duration::ZERO, &mut first).await.is_err());
+        let mut second = std::pin::pin!(registry.connection("s", &ct));
+        assert!(timeout(Duration::ZERO, &mut second).await.is_err());
+
+        // The first request started one attempt, and the second joined it
+        assert!(matches!(*status.borrow(), Status::Attempting(_)));
+        let result = retries.try_recv().unwrap();
+        assert!(retries.try_recv().is_err());
+        result.send_replace(Some(Err("new".into())));
+        assert_eq!(first.await.err().unwrap(), "server `s` failed: new");
+        assert_eq!(second.await.err().unwrap(), "server `s` failed: new");
+    }
+
+    #[tokio::test]
+    async fn cancelled_requests_do_not_retry() {
+        let (registry, status, mut retries) = registry();
+        status.send_replace(Status::Failed("old".into()));
+        let ct = CancellationToken::new();
+        ct.cancel();
+
+        let error = registry.connection("s", &ct).await.err().unwrap();
+        assert_eq!(error, "server `s` failed: old");
+        assert!(retries.try_recv().is_err());
+        assert!(matches!(*status.borrow(), Status::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn stays_failed_if_the_task_stopped() {
+        let (registry, status, retries) = registry();
+        status.send_replace(Status::Failed("old".into()));
+        drop(retries);
+
+        let error = registry.connection("s", &CancellationToken::new()).await;
+        assert_eq!(
+            error.err().unwrap(),
+            "server `s` can't retry: its task stopped"
+        );
+        assert!(matches!(*status.borrow(), Status::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn request_retries_skip_the_background_limit() {
+        let server = crate::config::Server {
+            description: None,
+            transport: Transport::Stdio {
+                command: "sh".into(),
+                args: vec!["-c".into(), "echo boom >&2; exit 1".into()],
+                env: BTreeMap::new(),
+            },
+        };
+        let config = Config {
+            servers: BTreeMap::from([("s".to_owned(), server)]),
+        };
+        let delays = [Duration::from_millis(10); 2];
+        let registry = Registry::start(&config, Duration::from_secs(1), delays);
+        let mut status = registry.servers["s"].status.subscribe();
+        timeout(
+            Duration::from_secs(10),
+            status.wait_for(|status| matches!(status, Status::Failed(_))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // With every permit held, only an attempt that skips the limit can run
+        let _permits = registry
+            .background_permits
+            .clone()
+            .acquire_many_owned(MAX_BACKGROUND_ATTEMPTS as u32)
+            .await
+            .unwrap();
+        let ct = CancellationToken::new();
+        let error = timeout(Duration::from_secs(10), registry.connection("s", &ct))
+            .await
+            .expect("the request's attempt shouldn't wait for a permit")
+            .err()
+            .unwrap();
+        assert!(error.contains("boom"), "{error}");
     }
 
     #[test]
