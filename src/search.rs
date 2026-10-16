@@ -2,12 +2,16 @@ use std::{
     collections::{HashMap, HashSet},
     ops::ControlFlow,
     sync::Arc,
+    time::Duration,
 };
 
 use rmcp::model::{JsonObject, Tool};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, Notify, watch},
+    time::{Instant, timeout},
+};
 
 use crate::config::ServerId;
 
@@ -18,6 +22,13 @@ const B: f64 = 0.75;
 const SERVER_PRIOR: f64 = 1.25;
 /// The most text taken from a tool's input schema
 const SCHEMA_TEXT_BYTES: usize = 16_384;
+
+/// How long the catalog has to go without changing before the index is rebuilt in the
+/// background, so a burst of changes, like servers connecting at startup, costs one rebuild
+const SETTLE: Duration = Duration::from_millis(100);
+/// The longest a background rebuild waits for things to settle, so a catalog that keeps
+/// changing still gets rebuilt
+const MAX_SETTLE: Duration = Duration::from_secs(1);
 
 /// The fields a tool is searched by, and how much each counts: names and titles count three
 /// times as much as descriptions and parameters
@@ -118,6 +129,8 @@ impl FieldIndex {
 #[derive(Default)]
 pub struct IndexCache {
     index: Mutex<Option<Arc<Index>>>,
+    #[cfg(test)]
+    builds: std::sync::atomic::AtomicUsize,
 }
 
 impl IndexCache {
@@ -135,6 +148,9 @@ impl IndexCache {
         {
             return Ok(index.clone());
         }
+        #[cfg(test)]
+        self.builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Big catalogs take a while to index, so it happens off the async threads
         let index = tokio::task::spawn_blocking(move || Index::new(catalog))
             .await
@@ -142,6 +158,42 @@ impl IndexCache {
         let index = Arc::new(index);
         *cached = Some(index.clone());
         Ok(index)
+    }
+
+    /// Rebuilds the index in the background whenever the catalog changes, so searches
+    /// usually find it ready. Searches don't rely on this: they still rebuild an outdated
+    /// index themselves.
+    pub async fn keep_warm<T: Send + Sync + 'static>(
+        self: Arc<Self>,
+        statuses: Vec<watch::Receiver<T>>,
+        catalog: impl Fn() -> Vec<CatalogServer>,
+    ) {
+        // `notify_one` keeps a permit when nobody's waiting, so changes during a rebuild
+        // aren't missed
+        let changed = Arc::new(Notify::new());
+        for mut status in statuses {
+            let changed = changed.clone();
+            tokio::spawn(async move {
+                while status.changed().await.is_ok() {
+                    changed.notify_one();
+                }
+            });
+        }
+        // New receivers count the current status as seen, so servers that are already ready
+        // wouldn't announce themselves. This builds the index for them.
+        changed.notify_one();
+        loop {
+            changed.notified().await;
+            // Waits until nothing has changed for `SETTLE`, but no longer than `MAX_SETTLE`
+            let deadline = Instant::now() + MAX_SETTLE;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || timeout(SETTLE.min(left), changed.notified()).await.is_err() {
+                    break;
+                }
+            }
+            let _ = self.get(&catalog).await;
+        }
     }
 }
 
@@ -640,6 +692,105 @@ mod tests {
         for &(query, server_ids, max, expected) in cases {
             assert_eq!(search(&index, query, server_ids, max), expected, "{query}");
         }
+    }
+
+    /// Changes one server's tool list, as a reconnect would, and announces it
+    fn change(catalog: &std::sync::Mutex<Vec<CatalogServer>>, status: &watch::Sender<u32>) {
+        let mut catalog = catalog.lock().unwrap();
+        let ServerState::Ready(tools) = &catalog[0].state else {
+            unreachable!()
+        };
+        catalog[0].state = ServerState::Ready(tools.to_vec().into());
+        status.send_modify(|version| *version += 1);
+    }
+
+    fn builds(cache: &IndexCache) -> usize {
+        cache.builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuilds_once_things_settle() {
+        let cache = Arc::new(IndexCache::default());
+        let current = Arc::new(std::sync::Mutex::new(catalog()));
+        let (status, receiver) = watch::channel(0);
+        let catalog = {
+            let current = current.clone();
+            move || current.lock().unwrap().clone()
+        };
+        tokio::spawn(cache.clone().keep_warm(vec![receiver], catalog));
+
+        // A burst of changes, each sooner than `SETTLE` after the last
+        for _ in 0..5 {
+            change(&current, &status);
+            tokio::time::sleep(SETTLE / 2).await;
+        }
+        assert_eq!(builds(&cache), 0, "nothing settled yet");
+        tokio::time::sleep(SETTLE * 2).await;
+        assert_eq!(builds(&cache), 1);
+        let index = cache.index.lock().await.clone().unwrap();
+        assert!(index.is_for(&current.lock().unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn builds_catalogs_that_were_ready_before_it_started() {
+        let cache = Arc::new(IndexCache::default());
+        let servers = catalog();
+        let (_status, receiver) = watch::channel(0);
+        tokio::spawn(
+            cache
+                .clone()
+                .keep_warm(vec![receiver], move || servers.clone()),
+        );
+
+        tokio::time::sleep(SETTLE * 2).await;
+        assert_eq!(builds(&cache), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuilds_within_the_cap_however_close_the_changes() {
+        let cache = Arc::new(IndexCache::default());
+        let current = Arc::new(std::sync::Mutex::new(catalog()));
+        let (status, receiver) = watch::channel(0);
+        let catalog = {
+            let current = current.clone();
+            move || current.lock().unwrap().clone()
+        };
+        tokio::spawn(cache.clone().keep_warm(vec![receiver], catalog));
+
+        // Changes every 90 ms, so each lands just before the wait for a pause runs out
+        let changes = tokio::spawn(async move {
+            loop {
+                change(&current, &status);
+                tokio::time::sleep(SETTLE * 9 / 10).await;
+            }
+        });
+        tokio::time::sleep(MAX_SETTLE + Duration::from_millis(5)).await;
+        assert_eq!(
+            builds(&cache),
+            1,
+            "the first rebuild should be at most `MAX_SETTLE` in"
+        );
+        changes.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebuilds_a_catalog_that_never_settles() {
+        let cache = Arc::new(IndexCache::default());
+        let current = Arc::new(std::sync::Mutex::new(catalog()));
+        let (status, receiver) = watch::channel(0);
+        let catalog = {
+            let current = current.clone();
+            move || current.lock().unwrap().clone()
+        };
+        tokio::spawn(cache.clone().keep_warm(vec![receiver], catalog));
+
+        // Changes every half `SETTLE` for a little over two `MAX_SETTLE`s
+        let started = Instant::now();
+        while started.elapsed() < MAX_SETTLE * 2 + SETTLE {
+            change(&current, &status);
+            tokio::time::sleep(SETTLE / 2).await;
+        }
+        assert!(builds(&cache) >= 2, "{} builds", builds(&cache));
     }
 
     #[tokio::test]

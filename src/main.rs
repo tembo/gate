@@ -304,10 +304,15 @@ async fn serve() -> anyhow::Result<()> {
         Duration::from_secs(args.code_timeout),
         registry.clone(),
     );
+    let search = Arc::new(IndexCache::default());
+    tokio::spawn(search.clone().keep_warm(registry.subscribe(), {
+        let registry = registry.clone();
+        move || registry.catalog()
+    }));
     Gate {
         config,
         registry,
-        search: Arc::default(),
+        search,
         code,
     }
     .serve(stdio())

@@ -180,6 +180,14 @@ impl Registry {
         }
     }
 
+    /// Each server's status, to watch for changes
+    pub fn subscribe(&self) -> Vec<watch::Receiver<Status>> {
+        self.servers
+            .values()
+            .map(|server| server.status.subscribe())
+            .collect()
+    }
+
     /// Captures each server's status once, for a batch of searches. Never waits for a
     /// connection or starts a retry.
     pub fn catalog(&self) -> Vec<CatalogServer> {
