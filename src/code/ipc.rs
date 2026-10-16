@@ -3,6 +3,8 @@
 //! Each message is a 4-byte big-endian length, then that many bytes of JSON. Lengths over
 //! `MAX_MESSAGE_BYTES` are rejected before anything is allocated, in both directions.
 
+use std::io::Write;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -10,14 +12,23 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// The largest message either side sends or accepts
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
+/// What the parent sends. `R` is a tool call's result: the parent sends rmcp's
+/// `CallToolResult` as is, and the worker reads it as plain JSON.
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ToWorker {
+pub enum ToWorker<R = Value> {
     Start { code: String, timeout_ms: u64 },
+    CallResult { id: u64, outcome: Result<R, String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum FromWorker {
     Log(String),
+    Call {
+        id: u64,
+        server_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
     Complete {
         result: Value,
         warnings: Vec<String>,
@@ -27,18 +38,39 @@ pub enum FromWorker {
     },
 }
 
-/// Serializes a message with its length prefix
+/// Serializes a message with its length prefix. Stops as soon as the message is too large,
+/// rather than serializing all of it first.
 pub fn encode(message: &impl Serialize) -> Result<Vec<u8>, String> {
-    let json =
-        serde_json::to_vec(message).map_err(|error| format!("can't encode message: {error}"))?;
-    if json.len() > MAX_MESSAGE_BYTES {
-        return Err(too_large(json.len()));
+    let mut writer = LimitedWriter(vec![0; 4]);
+    if let Err(error) = serde_json::to_writer(&mut writer, message) {
+        return Err(match error.io_error_kind() {
+            Some(std::io::ErrorKind::FileTooLarge) => {
+                format!("the message exceeds the {MAX_MESSAGE_BYTES}-byte limit")
+            }
+            _ => format!("can't encode message: {error}"),
+        });
     }
-    let length = u32::try_from(json.len()).expect("checked against the limit");
-    let mut bytes = Vec::with_capacity(4 + json.len());
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(&json);
+    let mut bytes = writer.0;
+    let length = u32::try_from(bytes.len() - 4).expect("limited to MAX_MESSAGE_BYTES");
+    bytes[..4].copy_from_slice(&length.to_be_bytes());
     Ok(bytes)
+}
+
+/// Collects a message's JSON, after room for its length, failing once it's too large
+struct LimitedWriter(Vec<u8>);
+
+impl Write for LimitedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() - 4 + data.len() > MAX_MESSAGE_BYTES {
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        self.0.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Reads the next message, or `None` if the stream ended cleanly between messages
@@ -119,6 +151,13 @@ mod tests {
     #[test]
     fn refuses_to_encode_large_messages() {
         let message = FromWorker::Log("x".repeat(MAX_MESSAGE_BYTES));
-        assert!(encode(&message).unwrap_err().contains("over the"));
+        assert_eq!(
+            encode(&message).unwrap_err(),
+            "the message exceeds the 4194304-byte limit"
+        );
+        // Right at the limit is fine: the JSON is the string plus its two quotes, and
+        // `{"Log":}`
+        let fits = FromWorker::Log("x".repeat(MAX_MESSAGE_BYTES - 10));
+        assert_eq!(encode(&fits).unwrap().len(), 4 + MAX_MESSAGE_BYTES);
     }
 }

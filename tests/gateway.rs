@@ -10,6 +10,7 @@ use axum::{
 };
 use rmcp::{
     RoleClient, ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters,
     model::{CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ServerResult},
     service::{PeerRequestOptions, RequestHandle, RunningService},
     tool, tool_handler, tool_router,
@@ -19,14 +20,14 @@ use rmcp::{
     },
 };
 use serde_json::{Value, json};
-use std::{process::Stdio, time::Duration};
+use std::{process::Stdio, sync::Arc, time::Duration};
 use tempfile::TempDir;
 
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
     process::{ChildStderr, Command},
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -283,6 +284,15 @@ enum Event {
 #[derive(Clone)]
 struct Echo {
     events: mpsc::UnboundedSender<Event>,
+    /// `held` calls wait until this is `true`
+    release: watch::Receiver<bool>,
+    /// Notified when `sleep` or `held` starts
+    started: Arc<Notify>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Held {
+    n: u64,
 }
 
 #[tool_router]
@@ -295,6 +305,7 @@ impl Echo {
     #[tool(description = "Sleeps until cancelled")]
     async fn sleep(&self, ct: CancellationToken) -> String {
         let _ = self.events.send(Event::Started);
+        self.started.notify_one();
         tokio::select! {
             () = sleep(Duration::from_secs(30)) => "slept".into(),
             () = ct.cancelled() => {
@@ -302,6 +313,48 @@ impl Echo {
                 "cancelled".into()
             }
         }
+    }
+
+    #[tool(description = "Waits until the test releases it, then returns `n`")]
+    async fn held(
+        &self,
+        Parameters(Held { n }): Parameters<Held>,
+        ct: CancellationToken,
+    ) -> String {
+        let _ = self.events.send(Event::Started);
+        self.started.notify_one();
+        let mut release = self.release.clone();
+        tokio::select! {
+            _ = release.wait_for(|released| *released) => n.to_string(),
+            () = ct.cancelled() => {
+                let _ = self.events.send(Event::Cancelled);
+                "cancelled".into()
+            }
+        }
+    }
+
+    #[tool(description = "Waits until `sleep` or `held` has started")]
+    async fn until_started(&self) -> String {
+        self.started.notified().await;
+        "started".into()
+    }
+
+    #[tool(description = "Returns its arguments as JSON")]
+    async fn reflect(
+        &self,
+        Parameters(arguments): Parameters<serde_json::Map<String, Value>>,
+    ) -> String {
+        serde_json::to_string(&arguments).unwrap()
+    }
+
+    #[tool(description = "Returns 5 MiB of text")]
+    async fn big(&self) -> String {
+        "x".repeat(5 * 1024 * 1024)
+    }
+
+    #[tool(name = "then", description = "Named like a promise's method")]
+    async fn then_tool(&self) -> String {
+        "then".into()
     }
 }
 
@@ -313,6 +366,8 @@ struct EchoServer {
     events: mpsc::UnboundedReceiver<Event>,
     /// Requests are held until this is `true`, to keep the gateway connecting
     open: watch::Sender<bool>,
+    /// Releases `held` calls
+    release: watch::Sender<bool>,
 }
 
 impl EchoServer {
@@ -358,10 +413,14 @@ async fn serve_echo() -> EchoServer {
 
     let (sender, events) = mpsc::unbounded_channel();
     let (open, open_receiver) = watch::channel(true);
+    let (release, release_receiver) = watch::channel(false);
+    let started = Arc::new(Notify::new());
     let service: StreamableHttpService<Echo, LocalSessionManager> = StreamableHttpService::new(
         move || {
             Ok(Echo {
                 events: sender.clone(),
+                release: release_receiver.clone(),
+                started: started.clone(),
             })
         },
         Default::default(),
@@ -374,7 +433,12 @@ async fn serve_echo() -> EchoServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router).await });
-    EchoServer { url, events, open }
+    EchoServer {
+        url,
+        events,
+        open,
+        release,
+    }
 }
 
 fn echo(url: &str) -> Value {
@@ -409,7 +473,7 @@ async fn discovers_http_tools_with_headers() {
     let servers = gateway.servers().await;
     assert_eq!(servers[1]["serverId"], "echo");
     assert_eq!(servers[1]["transport"], "http");
-    assert_eq!(servers[1]["toolCount"], 2);
+    assert_eq!(servers[1]["toolCount"], 7);
 }
 
 #[tokio::test]
@@ -1032,8 +1096,12 @@ async fn searches_tools() {
     assert_eq!(found(&results[1]), ["inner/list_mcp_servers"]);
     assert_eq!(results[2], json!({ "error": "unknown server `nope`" }));
     let all = found(&results[3]);
-    assert_eq!(all.len(), 7);
-    assert_eq!(all[..2], ["echo/echo", "echo/sleep"]);
+    assert_eq!(all.len(), 12);
+    // In catalog order, so `echo`'s seven tools come first
+    assert!(
+        all[..7].iter().all(|tool| tool.starts_with("echo/")),
+        "{all:?}"
+    );
     assert_eq!(results[3]["excludedServers"], json!([]));
 }
 
@@ -1206,7 +1274,7 @@ async fn reports_script_errors() {
         ("return 1n;", "BigInt"),
         ("return () => 1;", "isn't JSON-serializable"),
         ("const f = () => f(); return f();", "stack"),
-        (r#"return "x".repeat(70000);"#, "over the 65536-byte limit"),
+        (r#"return "x".repeat(70000);"#, "over the 65024-byte limit"),
         (
             r#"for (;;) console.log("x".repeat(1000));"#,
             "logged more than",
@@ -1279,4 +1347,269 @@ async fn scripts_have_no_host_access() {
         )
         .await;
     assert_eq!(output["result"], json!(vec!["undefined"; 7]));
+}
+
+async fn code_gateway(server: &EchoServer, args: &[&str]) -> Gateway {
+    let servers = json!({ "echo": echo(&server.url), "inner": nested_gate() });
+    let (gateway, _) = Gateway::spawn(servers, &[TOKEN], args, Stdio::inherit()).await;
+    gateway.wait_for_status("echo", "ready").await;
+    gateway.wait_for_status("inner", "ready").await;
+    gateway
+}
+
+#[tokio::test]
+async fn scripts_call_tools() {
+    let server = serve_echo().await;
+    let gateway = code_gateway(&server, &[]).await;
+    let (output, is_error) = gateway
+        .run_code(
+            r#"
+            const inner = await mcp.inner.list_mcp_servers();
+            const reflected = await mcp.call("echo", "reflect", { nested: { items: [1, true, null, "café 🦀"] } });
+            const failed = await mcp.inner.get_mcp_tool_details({ tools: [] });
+            let unknown;
+            try { await mcp.nope.tool(); } catch (error) { unknown = error.message; }
+            const then = await mcp.call("echo", "then");
+            return {
+                inner: JSON.parse(inner.content[0].text),
+                reflected: JSON.parse(reflected.content[0].text),
+                failed: [failed.isError, failed.content[0].text],
+                unknown,
+                then: then.content[0].text,
+                proxy: [typeof mcp.then, typeof mcp.echo.then, typeof mcp[Symbol.iterator], typeof mcp.echo[Symbol.toPrimitive]],
+            };
+            "#,
+        )
+        .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(
+        output["result"],
+        json!({
+            "inner": { "servers": [] },
+            "reflected": { "nested": { "items": [1, true, null, "café 🦀"] } },
+            // A downstream error result resolves, rather than throwing
+            "failed": [true, "`tools` must have between 1 and 20 items"],
+            "unknown": "unknown server `nope`",
+            "then": "then",
+            "proxy": ["undefined", "undefined", "undefined", "undefined"],
+        })
+    );
+}
+
+#[tokio::test]
+async fn script_calls_run_in_parallel() {
+    let mut server = serve_echo().await;
+    let gateway = code_gateway(&server, &[]).await;
+    let script = gateway
+        .start_call(
+            "execute_mcp_code",
+            json!({ "code": r#"
+                const results = await Promise.all([1, 2, 3].map((n) => mcp.echo.held({ n })));
+                return results.map((result) => result.content[0].text);
+            "# }),
+        )
+        .await;
+    // All three are running before any is released
+    for _ in 0..3 {
+        assert_eq!(server.next_event().await, Event::Started);
+    }
+    server.release.send_replace(true);
+
+    let (output, is_error) = finish_call(script).await;
+    assert!(!is_error, "{output}");
+    assert_eq!(output, json!({ "result": ["1", "2", "3"] }));
+    assert_eq!(server.remaining_events().await, []);
+}
+
+#[tokio::test]
+async fn limits_script_calls() {
+    let server = serve_echo().await;
+    let gateway = code_gateway(&server, &[]).await;
+    let (output, _) = gateway
+        .run_code(
+            r#"
+            let tooLarge;
+            try { await mcp.echo.big(); } catch (error) { tooLarge = error.message; }
+            // Rejected before it's made, so it doesn't count toward the 100
+            let notObject;
+            try { await mcp.inner.list_mcp_servers([1]); } catch (error) { notObject = error.message; }
+            // All nine start before any can finish, so the ninth is refused, and isn't counted
+            const nine = await Promise.allSettled(Array.from({ length: 9 }, () => mcp.inner.list_mcp_servers()));
+            const ninth = nine[8].reason.message;
+            for (let made = 9; made < 100; made++) await mcp.inner.list_mcp_servers();
+            let hundredFirst;
+            try { await mcp.inner.list_mcp_servers(); } catch (error) { hundredFirst = error.message; }
+            return { fulfilled: nine.filter((r) => r.status === "fulfilled").length, ninth, hundredFirst, notObject, tooLarge };
+            "#,
+        )
+        .await;
+    let result = &output["result"];
+    assert_eq!(result["fulfilled"], 8, "{output}");
+    assert_eq!(
+        result["ninth"],
+        "the script has 8 tool calls in flight already; await some before making more"
+    );
+    assert_eq!(
+        result["hundredFirst"],
+        "the script made more than 100 tool calls"
+    );
+    assert_eq!(result["notObject"], "a tool's arguments must be an object");
+    let too_large = result["tooLarge"].as_str().unwrap_or_default();
+    assert!(
+        too_large.contains("ran, but its result exceeds the 4194304-byte limit"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn timing_out_cancels_script_calls() {
+    let mut server = serve_echo().await;
+    let gateway = code_gateway(&server, &["--code-timeout", "1"]).await;
+    let error = gateway.code_error("await mcp.echo.sleep();").await;
+    assert!(
+        error.starts_with("the script timed out after 1s"),
+        "{error}"
+    );
+    assert_eq!(server.next_event().await, Event::Started);
+    assert_eq!(server.next_event().await, Event::Cancelled);
+}
+
+#[tokio::test]
+async fn cancelling_a_script_cancels_its_calls() {
+    let mut server = serve_echo().await;
+    let gateway = code_gateway(&server, &[]).await;
+    let script = gateway
+        .start_call(
+            "execute_mcp_code",
+            json!({ "code": "await mcp.echo.sleep();" }),
+        )
+        .await;
+    assert_eq!(server.next_event().await, Event::Started);
+    script.cancel(None).await.unwrap();
+    assert_eq!(server.next_event().await, Event::Cancelled);
+}
+
+const CANCELLED_CALL: &str = "1 tool call was still running when the script ended; cancellation was requested, but it may already have taken effect";
+
+#[tokio::test]
+async fn cancels_calls_scripts_do_not_await() {
+    let mut server = serve_echo().await;
+    let gateway = code_gateway(&server, &[]).await;
+
+    // Returning right away: the call may not even have reached the server
+    let output = gateway.run_code("mcp.echo.sleep(); return 1;").await;
+    assert_eq!(
+        output,
+        (json!({ "result": 1, "warnings": [CANCELLED_CALL] }), false)
+    );
+    let events = server.remaining_events().await;
+    assert!(
+        events.is_empty() || events == [Event::Started, Event::Cancelled],
+        "{events:?}"
+    );
+
+    // Returning once the server has started it
+    let output = gateway
+        .run_code("mcp.echo.sleep(); await mcp.echo.until_started(); return 1;")
+        .await;
+    assert_eq!(
+        output,
+        (json!({ "result": 1, "warnings": [CANCELLED_CALL] }), false)
+    );
+    assert_eq!(server.next_event().await, Event::Started);
+    assert_eq!(server.next_event().await, Event::Cancelled);
+}
+
+#[tokio::test]
+async fn results_leave_room_for_the_cancelled_calls_warning() {
+    let server = serve_echo().await;
+    let gateway = code_gateway(&server, &[]).await;
+    // `{"result":""}` is 13 bytes, and results and logs get 65024
+    let (output, is_error) = gateway
+        .run_code(r#"mcp.echo.sleep(); return "r".repeat(65011);"#)
+        .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(output["result"].as_str().unwrap().len(), 65011);
+    assert_eq!(output["warnings"], json!([CANCELLED_CALL]));
+
+    let error = gateway
+        .code_error(r#"mcp.echo.sleep(); return "r".repeat(65012);"#)
+        .await;
+    assert!(error.contains("over the 65024-byte limit"), "{error}");
+}
+
+#[tokio::test]
+async fn cancelled_script_calls_are_not_dispatched_after_connecting() {
+    let mut server = serve_echo().await;
+    // Keeps the gateway connecting to `echo` until the script has timed out
+    server.open.send_replace(false);
+    let (gateway, _) = Gateway::spawn(
+        json!({ "echo": echo(&server.url) }),
+        &[TOKEN],
+        &["--code-timeout", "1"],
+        Stdio::inherit(),
+    )
+    .await;
+    let error = gateway.code_error("await mcp.echo.sleep();").await;
+    assert!(error.starts_with("the script timed out"), "{error}");
+
+    server.open.send_replace(true);
+    gateway.wait_for_status("echo", "ready").await;
+    assert_eq!(
+        server.remaining_events().await,
+        [],
+        "the call shouldn't be dispatched"
+    );
+}
+
+/// Writes a message to a worker, framed the way gate does
+async fn write_message(stdin: &mut tokio::process::ChildStdin, message: Value) {
+    use tokio::io::AsyncWriteExt;
+    let json = message.to_string();
+    stdin
+        .write_all(&(json.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stdin.write_all(json.as_bytes()).await.unwrap();
+    stdin.flush().await.unwrap();
+}
+
+async fn read_message(stdout: &mut tokio::process::ChildStdout) -> Value {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0; 4];
+    stdout.read_exact(&mut length).await.unwrap();
+    let mut json = vec![0; u32::from_be_bytes(length) as usize];
+    stdout.read_exact(&mut json).await.unwrap();
+    serde_json::from_slice(&json).unwrap()
+}
+
+#[tokio::test]
+async fn workers_fail_pending_calls_when_the_gateway_disconnects() {
+    // Plays the gateway's side, then goes away mid-call
+    let mut worker = Command::new(GATE)
+        .arg("--code-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = worker.stdin.take().unwrap();
+    let mut stdout = worker.stdout.take().unwrap();
+    let code = r#"try { await mcp.call("s", "t"); return "resolved"; } catch (error) { return error.message; }"#;
+    write_message(
+        &mut stdin,
+        json!({ "Start": { "code": code, "timeout_ms": 5000 } }),
+    )
+    .await;
+
+    let call = read_message(&mut stdout).await;
+    assert_eq!(call["Call"]["server_id"], "s");
+    drop(stdin);
+    let complete = timeout(Duration::from_secs(5), read_message(&mut stdout))
+        .await
+        .unwrap();
+    assert_eq!(
+        complete["Complete"]["result"],
+        "the gateway disconnected before the call's result arrived"
+    );
 }

@@ -298,7 +298,11 @@ async fn serve() -> anyhow::Result<()> {
     ));
     let executable = std::env::current_exe()
         .map_err(|error| anyhow::anyhow!("can't find gate's own executable: {error}"))?;
-    let code = CodeRunner::new(executable, Duration::from_secs(args.code_timeout));
+    let code = CodeRunner::new(
+        executable,
+        Duration::from_secs(args.code_timeout),
+        registry.clone(),
+    );
     Gate {
         config,
         registry,
