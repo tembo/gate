@@ -7,6 +7,7 @@ use std::{
 use rmcp::model::{JsonObject, Tool};
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::config::ServerId;
 
@@ -30,12 +31,14 @@ const FIELD_BOOSTS: [f64; 6] = [
 ];
 
 /// A server, as captured once for a batch of searches
+#[derive(Clone)]
 pub struct CatalogServer {
     pub id: ServerId,
     pub description: Option<String>,
     pub state: ServerState,
 }
 
+#[derive(Clone)]
 pub enum ServerState {
     Ready(Arc<[Tool]>),
     Connecting,
@@ -111,7 +114,59 @@ impl FieldIndex {
     }
 }
 
+/// The index of the current catalog, kept until the catalog changes
+#[derive(Default)]
+pub struct IndexCache {
+    index: Mutex<Option<Arc<Index>>>,
+}
+
+impl IndexCache {
+    /// The index of `catalog()`'s servers, reusing the last one if nothing has changed. The
+    /// catalog is captured while holding the lock, so searches that arrive during a rebuild
+    /// wait for it and reuse it, rather than each building their own.
+    pub async fn get(
+        &self,
+        catalog: impl FnOnce() -> Vec<CatalogServer>,
+    ) -> Result<Arc<Index>, String> {
+        let mut cached = self.index.lock().await;
+        let catalog = catalog();
+        if let Some(index) = &*cached
+            && index.is_for(&catalog)
+        {
+            return Ok(index.clone());
+        }
+        // Big catalogs take a while to index, so it happens off the async threads
+        let index = tokio::task::spawn_blocking(move || Index::new(catalog))
+            .await
+            .map_err(|error| format!("can't build the search index: {error}"))?;
+        let index = Arc::new(index);
+        *cached = Some(index.clone());
+        Ok(index)
+    }
+}
+
 impl Index {
+    /// Whether this index was built from the same catalog: the same servers, in the same
+    /// states, with the same tool lists. Lists are compared by identity, which is cheap and
+    /// safe: every connection gets a new list, and this index keeps its own alive, so a new
+    /// list can't reuse its address.
+    pub fn is_for(&self, catalog: &[CatalogServer]) -> bool {
+        self.servers.len() == catalog.len()
+            && self.servers.iter().zip(catalog).all(|(indexed, current)| {
+                indexed.id == current.id
+                    && match (&indexed.state, &current.state) {
+                        (ServerState::Ready(indexed), ServerState::Ready(current)) => {
+                            Arc::ptr_eq(indexed, current)
+                        }
+                        (ServerState::Connecting, ServerState::Connecting) => true,
+                        (ServerState::Failed(indexed), ServerState::Failed(current)) => {
+                            Arc::ptr_eq(indexed, current)
+                        }
+                        _ => false,
+                    }
+            })
+    }
+
     pub fn new(servers: Vec<CatalogServer>) -> Self {
         let mut documents = Vec::new();
         let mut fields: [FieldIndex; FIELD_BOOSTS.len()] = Default::default();
@@ -585,6 +640,59 @@ mod tests {
         for &(query, server_ids, max, expected) in cases {
             assert_eq!(search(&index, query, server_ids, max), expected, "{query}");
         }
+    }
+
+    #[tokio::test]
+    async fn reuses_the_index_until_the_catalog_changes() {
+        let cache = IndexCache::default();
+        let servers = catalog();
+        let first = cache.get(|| servers.clone()).await.unwrap();
+        let again = cache.get(|| servers.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        // Searches arriving while it's built wait for that build, rather than starting their own
+        let empty = IndexCache::default();
+        let indexes =
+            futures::future::join_all((0..8).map(|_| empty.get(|| servers.clone()))).await;
+        let built = indexes[0].as_ref().unwrap();
+        assert!(
+            indexes
+                .iter()
+                .all(|index| Arc::ptr_eq(built, index.as_ref().unwrap()))
+        );
+
+        // Concurrent searches share it too
+        let indexes =
+            futures::future::join_all((0..8).map(|_| cache.get(|| servers.clone()))).await;
+        for index in indexes {
+            assert!(Arc::ptr_eq(&first, &index.unwrap()));
+        }
+
+        // A reconnect gives a server a new tool list, even with the same tools
+        let mut reconnected = servers.clone();
+        let ServerState::Ready(tools) = &reconnected[2].state else {
+            unreachable!()
+        };
+        reconnected[2].state = ServerState::Ready(tools.to_vec().into());
+        let after_reconnect = cache.get(|| reconnected.clone()).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &after_reconnect));
+
+        // So does a server going down, which changes what's excluded
+        let mut down = reconnected.clone();
+        down[2].state = ServerState::Failed("refused".into());
+        let after_failure = cache.get(|| down.clone()).await.unwrap();
+        assert!(!Arc::ptr_eq(&after_reconnect, &after_failure));
+        let results = after_failure.search("issue", None, 20).unwrap();
+        assert_eq!(results.excluded_servers[0].server_id, "linear");
+        assert!(
+            results
+                .matches
+                .iter()
+                .all(|found| found.server_id != "linear")
+        );
+        // Staying down with the same error keeps the index
+        let still_down = cache.get(|| down.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&after_failure, &still_down));
     }
 
     #[test]

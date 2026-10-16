@@ -23,7 +23,7 @@ use crate::{
     code::CodeRunner,
     config::Config,
     registry::{Registry, RetryDelays, Status},
-    search::Index,
+    search::IndexCache,
 };
 
 const MAX_BATCH: usize = 20;
@@ -127,6 +127,7 @@ struct ExecuteCode {
 struct Gate {
     config: Arc<Config>,
     registry: Arc<Registry>,
+    search: Arc<IndexCache>,
     code: CodeRunner,
 }
 
@@ -183,7 +184,7 @@ impl Gate {
             ));
         }
         // One index for the whole batch, so every search sees the same servers and tools
-        let index = Index::new(self.registry.catalog());
+        let index = self.search.get(|| self.registry.catalog()).await?;
         let results: Vec<_> = searches
             .iter()
             .map(|search| {
@@ -306,6 +307,7 @@ async fn serve() -> anyhow::Result<()> {
     Gate {
         config,
         registry,
+        search: Arc::default(),
         code,
     }
     .serve(stdio())
