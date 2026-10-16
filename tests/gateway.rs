@@ -16,7 +16,9 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::{
         TokioChildProcess,
-        streamable_http_server::{StreamableHttpService, session::local::LocalSessionManager},
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        },
     },
 };
 use serde_json::{Value, json};
@@ -295,6 +297,11 @@ struct Held {
     n: u64,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Nap {
+    ms: u64,
+}
+
 #[tool_router]
 impl Echo {
     #[tool(description = "Echoes")]
@@ -331,6 +338,12 @@ impl Echo {
                 "cancelled".into()
             }
         }
+    }
+
+    #[tool(description = "Sleeps for `ms` milliseconds")]
+    async fn nap(&self, Parameters(Nap { ms }): Parameters<Nap>) -> String {
+        sleep(Duration::from_millis(ms)).await;
+        "napped".into()
     }
 
     #[tool(description = "Waits until `sleep` or `held` has started")]
@@ -388,8 +401,21 @@ impl EchoServer {
     }
 }
 
+/// How `Echo` answers requests over HTTP
+#[derive(Clone, Copy, Debug)]
+enum Responses {
+    /// Opens an SSE stream for each response, rmcp's default
+    Sse,
+    /// Answers with plain JSON, without a session
+    Json,
+}
+
 /// Serves `Echo` over Streamable HTTP, only to requests with `Authorization: Bearer test-token`
 async fn serve_echo() -> EchoServer {
+    serve_echo_with(Responses::Sse).await
+}
+
+async fn serve_echo_with(responses: Responses) -> EchoServer {
     async fn require_token(request: Request, next: Next) -> Response {
         let authorized = request
             .headers()
@@ -424,7 +450,12 @@ async fn serve_echo() -> EchoServer {
             })
         },
         Default::default(),
-        Default::default(),
+        match responses {
+            Responses::Sse => StreamableHttpServerConfig::default(),
+            Responses::Json => StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(true),
+        },
     );
     let router = axum::Router::new()
         .nest_service("/mcp", service)
@@ -473,7 +504,7 @@ async fn discovers_http_tools_with_headers() {
     let servers = gateway.servers().await;
     assert_eq!(servers[1]["serverId"], "echo");
     assert_eq!(servers[1]["transport"], "http");
-    assert_eq!(servers[1]["toolCount"], 7);
+    assert_eq!(servers[1]["toolCount"], 8);
 }
 
 #[tokio::test]
@@ -1096,10 +1127,10 @@ async fn searches_tools() {
     assert_eq!(found(&results[1]), ["inner/list_mcp_servers"]);
     assert_eq!(results[2], json!({ "error": "unknown server `nope`" }));
     let all = found(&results[3]);
-    assert_eq!(all.len(), 12);
-    // In catalog order, so `echo`'s seven tools come first
+    assert_eq!(all.len(), 13);
+    // In catalog order, so `echo`'s eight tools come first
     assert!(
-        all[..7].iter().all(|tool| tool.starts_with("echo/")),
+        all[..8].iter().all(|tool| tool.starts_with("echo/")),
         "{all:?}"
     );
     assert_eq!(results[3]["excludedServers"], json!([]));
@@ -1612,4 +1643,37 @@ async fn workers_fail_pending_calls_when_the_gateway_disconnects() {
         complete["Complete"]["result"],
         "the gateway disconnected before the call's result arrived"
     );
+}
+
+/// Makes 64 calls to `held` at once, checking they all reach the server before any returns
+async fn makes_concurrent_http_calls(responses: Responses) {
+    let mut server = serve_echo_with(responses).await;
+    let gateway = Gateway::start(json!({ "echo": echo(&server.url) }), &[TOKEN]).await;
+    gateway.wait_for_status("echo", "ready").await;
+
+    let mut calls = Vec::new();
+    for n in 0..64 {
+        let arguments = json!({ "serverId": "echo", "toolName": "held", "arguments": { "n": n } });
+        calls.push(gateway.start_call("call_mcp_tool", arguments).await);
+    }
+    for started in 0..64 {
+        let event = timeout(Duration::from_secs(5), server.events.recv()).await;
+        let event =
+            event.unwrap_or_else(|_| panic!("{responses:?}: only {started} of 64 calls started"));
+        assert_eq!(event, Some(Event::Started));
+    }
+    server.release.send_replace(true);
+    for (n, call) in calls.into_iter().enumerate() {
+        assert_eq!(finish_call(call).await, (json!(n), false));
+    }
+}
+
+#[tokio::test]
+async fn makes_concurrent_calls_to_sse_servers() {
+    makes_concurrent_http_calls(Responses::Sse).await;
+}
+
+#[tokio::test]
+async fn makes_concurrent_calls_to_json_servers() {
+    makes_concurrent_http_calls(Responses::Json).await;
 }

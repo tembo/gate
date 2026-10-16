@@ -49,6 +49,7 @@ const STDERR_TAIL_BYTES: usize = 4096;
 /// [mcp:noisy] xxxx…   (1808 bytes)
 /// ```
 const STDERR_LINE_BYTES: usize = 4096;
+const HTTP_CONCURRENT_REQUESTS: usize = 256;
 
 /// How long to wait before reconnecting to a server whose connection closed, like the
 /// original gateway. The retry delays then apply as usual.
@@ -536,10 +537,14 @@ async fn connect(id: &str, transport: &Transport) -> Result<(Client, Vec<Tool>)>
                     }
                 })
                 .collect::<Result<HashMap<_, _>>>()?;
-            let transport = StreamableHttpClientTransport::from_config(
-                StreamableHttpClientTransportConfig::with_uri(url.as_str())
-                    .custom_headers(custom_headers),
-            );
+            let transport = StreamableHttpClientTransport::from_config({
+                let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                    .custom_headers(custom_headers)
+                    .max_concurrent_requests(HTTP_CONCURRENT_REQUESTS);
+
+                config.channel_buffer_capacity = HTTP_CONCURRENT_REQUESTS;
+                config
+            });
             handshake(transport)
                 .await
                 .map_err(|error| anyhow!("{}", redact_urls(&format!("{error:#}"))))
