@@ -1,6 +1,6 @@
 # Design: credential providers and access policies
 
-Status: draft
+Status: draft, revision 2
 
 ## Summary
 
@@ -8,22 +8,24 @@ gate takes every server's secrets from its config file and environment, and show
 configured server to every request. That's enough for most users, but not for platforms that
 run gate on someone else's behalf. Those platforms need to:
 
-- hand servers short-lived credentials, refresh them before they expire, and replace them
-  when a server rejects them
-- decide, request by request, which servers the caller may see and use
+- hand servers short-lived credentials, refresh them before they expire, replace them when a
+  server rejects them, and stop using them when they're revoked
+- decide, request by request, which servers the current caller may see and use
 
 This document proposes two optional hooks for that, **credential providers** and **access
-policies**. gate defines their protocols and does the hard parts itself: caching, refresh,
-rotation, telling auth failures apart from other errors, keeping secrets out of logs, and
-failing closed. The platform-specific logic stays behind the hook, in the platform's own
-code. A config that uses neither hook behaves exactly as gate does today.
+policies**. gate defines their protocols and owns everything to do with connections:
+leases, rotation, telling auth failures apart from other errors, cleaning its own
+diagnostics, and failing closed. Who the caller is, what they may use and where credentials
+come from stay behind the hooks, in the platform's own code. A config that uses neither hook
+behaves exactly as gate does today.
 
 ## Goals
 
 - No change for existing configs, and nothing new to learn for users who don't need this
 - Nothing in gate that's specific to one platform, vendor or MCP server
 - Hooks that can be written in any language, with no need to build gate from source
-- Secrets that reach only the server they're for, and never logs or the agent's context
+- Rules precise enough to implement and test: what happens to every call when a credential
+  is refreshed, rotated, rejected or revoked
 - The same guarantees gate gives today: no replayed calls, bounded output, cancellation
   that reaches downstream servers
 
@@ -33,21 +35,46 @@ code. A config that uses neither hook behaves exactly as gate does today.
   result, but gate won't redirect browsers or store refresh tokens.
 - Policies that rewrite or filter tool arguments or results. Access is per server.
 - Hooks that change a server's non-secret config, like its URL or command.
+- Isolating servers from each other or from gate. Servers run as gate's user, as they do
+  today (see [Trust model](#trust-model)).
+- The legacy HTTP+SSE transport. MCP deprecated it in favor of Streamable HTTP, and rmcp, the
+  official Rust SDK, has no client for it. Servers that only speak SSE need to move to
+  Streamable HTTP or sit behind a bridge.
+
+## Trust model
+
+| Party | Trusted with |
+|---|---|
+| Whoever writes the config | Everything: it chooses the servers, hooks and their secrets |
+| Hooks | The secrets they're given, and the decisions they return |
+| Downstream servers | The credentials gate gives them. A server can return its own credential in a tool result, and gate can't stop that. |
+| The MCP client (the agent) | Nothing beyond tool results and gate's own messages |
+
+gate has no notion of who the caller is. When identity matters, the access policy determines
+it itself for every request, from credentials and state the platform controls. Data that the
+caller sends, like a request's `_meta`, is not identity.
+
+gate doesn't deliberately expose credentials. It cleans its own diagnostics and the server
+stderr it forwards (see [Secrets in diagnostics](#secrets-in-diagnostics)). Hooks and
+downstream servers remain responsible for the secrets they receive.
 
 ## Overview
 
 ```jsonc
 {
+  "hookEnv": ["PLATFORM_TOKEN"],
+  "inheritEnv": ["PATH", "HOME", "LANG", "TMPDIR"],
   "credentialProviders": {
-    "vault": { "command": "vault-mcp-lease", "args": ["--role", "agents"] }
+    "platform": { "http": {
+      "url": "https://platform.example/gate/credentials",
+      "headers": { "Authorization": "Bearer ${PLATFORM_TOKEN}" }
+    } }
   },
   "accessPolicies": {
-    "platform": {
-      "http": {
-        "url": "https://platform.example/gate/access",
-        "headers": { "Authorization": "Bearer ${file:/run/platform/token}" }
-      }
-    }
+    "platform": { "http": {
+      "url": "https://platform.example/gate/access",
+      "headers": { "Authorization": "Bearer ${PLATFORM_TOKEN}" }
+    } }
   },
   "mcpServers": {
     "github": {
@@ -55,7 +82,7 @@ code. A config that uses neither hook behaves exactly as gate does today.
       "command": "github-mcp-server",
       "args": ["stdio"],
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${credential:token}" },
-      "credentials": { "provider": "vault", "params": { "path": "github/agents" } },
+      "credentials": { "provider": "platform", "params": { "connection": "c_123" } },
       "access": { "policy": "platform", "params": { "connection": "c_123" } }
     },
     "filesystem": { "command": "mcp-filesystem", "args": ["/srv"] }
@@ -66,10 +93,12 @@ code. A config that uses neither hook behaves exactly as gate does today.
 - `credentialProviders` and `accessPolicies` name hooks, each reached over HTTP or by running
   a command.
 - A server opts into a hook with `credentials` or `access`. Each has a `params` object that
-  gate passes to the hook as is and never reads. IDs, roles and paths mean whatever the
-  hook wants them to.
+  gate passes to the hook as is and never reads.
 - `${credential:NAME}` placeholders are filled from the server's current lease.
-- `filesystem` uses neither hook, so it works exactly as it does today.
+- `hookEnv` and `inheritEnv` control which variables servers get (see
+  [Environment](#environment)).
+- `filesystem` uses neither hook. Without `hookEnv` and `inheritEnv`, it would work exactly as
+  it does today.
 
 ## Hooks
 
@@ -77,25 +106,22 @@ Both kinds of hook share their transports and their request envelope.
 
 ### Transports
 
-**`http`**: gate sends `POST` with a JSON body and expects a `2xx` response with a JSON body.
-Any other status, a body that isn't valid JSON, or a body that doesn't match the schema is an
-error. `url` and `headers` support placeholders (see [Placeholders](#placeholders)), which are
-expanded for every request, so a `${file:…}` header picks up a rotated token.
+**`http`**: gate sends `POST` with a JSON body. `url` and `headers` support the usual
+placeholders, expanded when the config loads.
 
 **`command`**: gate runs `command` with `args`, writes the request to its stdin, closes stdin,
-and reads the response from stdout. A nonzero exit code is an error. One process runs per
-request, like git credential helpers or AWS `credential_process`. The command inherits gate's
-environment plus its own `env`, since it usually needs secrets that servers mustn't see
-(see [Environment isolation](#environment-isolation)).
+and reads the response from stdout. One process runs per request, like git credential helpers
+or AWS `credential_process`. The command inherits gate's environment, including `hookEnv`,
+plus its own `env`.
 
 Both transports also accept:
 
 | Field | Default | Meaning |
 |---|---|---|
 | `timeoutSeconds` | 10 for credentials, 5 for access | How long one request may take |
+| `stderr` | `"drop"` | `"forward"` copies a command hook's stderr to gate's, for debugging |
 
-Responses are limited to 64 KiB. A command's stderr goes to gate's stderr, prefixed with the
-hook's name, and never to the agent.
+Responses are limited to 64 KiB.
 
 ### Envelope
 
@@ -108,36 +134,39 @@ Every request has `version` and `kind`:
 `version` changes only for incompatible changes. Hooks should ignore fields they don't
 recognize, and so does gate.
 
-### Errors
+### What the agent sees
 
-A hook that errors, times out or answers with something invalid counts as a failed attempt.
-The agent sees a short, fixed message naming the server and the hook, never what the hook
-returned. Hooks can't put secrets in front of the agent by accident, even in their errors.
+Whatever a hook returns or fails with, the agent sees a short, fixed message naming the
+server and the outcome, like "server `github` is unavailable: its credentials were denied".
+It never sees a hook's error text, status code or body.
 
 ## Credential providers
 
-### Protocol
-
-Request:
+### Request
 
 ```json
 {
   "version": 1,
   "kind": "credentials",
   "server": "github",
-  "params": { "path": "github/agents" },
+  "params": { "connection": "c_123" },
   "rejectedCredentialId": "lease-41"
 }
 ```
 
 `rejectedCredentialId` is present only after a server rejected that credential (see
-[Auth failures](#auth-failures)). The provider should return a different one or fail.
+[Auth failures](#auth-failures)).
 
-Response:
+### Response
+
+A provider answers with one of three outcomes.
+
+**`lease`**: here's a credential.
 
 ```json
 {
-  "credentialId": "lease-42",
+  "outcome": "lease",
+  "credentialId": "cred-42",
   "values": { "token": "ghs_…" },
   "refreshAfter": "2026-11-04T12:00:00Z",
   "expiresAt": "2026-11-04T12:10:00Z",
@@ -149,97 +178,192 @@ Response:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `credentialId` | yes | Identifies this credential, so gate can report it as rejected |
-| `values` | yes | Fills the server's `${credential:NAME}` placeholders |
-| `refreshAfter` | no | When gate should get a new lease. Without it, gate keeps the lease until it's rejected or expires. |
-| `expiresAt` | no | When the lease stops being usable. Must not be before `refreshAfter`. |
-| `authFailures` | no | Extra ways to recognize a rejected credential in tool results |
+| `credentialId` | yes | Identifies the credential material, not this issuance. A provider that returns the same token again must return the same ID. gate reports it back as `rejectedCredentialId`. |
+| `values` | yes | Fills the server's `${credential:NAME}` placeholders, or its environment (see [Leased environments](#leased-environments)) |
+| `refreshAfter` | no | When gate should ask again. Without it, gate keeps the lease until it's rejected, denied or expires. |
+| `expiresAt` | no | When the lease must stop being used. Must not be before `refreshAfter`. |
+| `authFailures` | no | Extra ways to recognize a rejected credential in tool results, for this lease only |
+
+**`denied`**: the caller may no longer use this server's credentials, for example because the
+platform deactivated the session or the connection was removed. gate stops using any lease it
+has for the server.
+
+**`transient`**: the provider can't answer right now. gate keeps an unexpired lease and tries
+again later.
+
+```json
+{ "outcome": "denied" }
+```
+
+When a hook doesn't answer with an outcome, gate classifies the failure:
+
+| Failure | Outcome |
+|---|---|
+| HTTP `4xx` without a valid body | `denied` |
+| HTTP `5xx`, timeout, connection error | `transient` |
+| Command exits nonzero, or times out | `transient` |
+| A body that isn't valid JSON or doesn't match the schema | `transient` |
+
+So an existing endpoint that uses `403` and `404` for revoked access works without changes.
+gate never treats a malformed answer as a revocation, and never treats a revocation as a
+reason to retry.
+
+### Fingerprints
+
+gate also identifies credentials itself, by a SHA-256 fingerprint of `values` with sorted
+keys. Fingerprints stay in memory and are never logged. They let gate:
+
+- reconnect only when the values actually changed
+- refuse a lease whose values were already rejected, whatever its `credentialId`
 
 ### Placeholders
 
 `${credential:NAME}` is allowed in a server's `env` and `headers`, and nowhere else. Arguments
 show up in process listings and URLs show up in logs, so config loading rejects
-`${credential:…}` in `command`, `args` and `url`. If the lease has no value for a placeholder,
-the connection attempt fails and names the missing value, not the lease's other values.
+`${credential:…}` in `command`, `args` and `url`. If a lease has no value named `NAME`, the
+connection attempt fails, naming the missing value but no other value.
 
-This document also adds `${file:PATH}`, allowed anywhere existing placeholders are. It's
-replaced by the file's contents, minus one trailing newline, and read every time it's used:
-at each connection for a server, and at each request for a hook. That's how tokens that
-rotate while gate is running, like Kubernetes projected tokens or a platform's per-session
-token, reach a hook without restarting gate.
+### Leased environments
 
-### Lifecycle
+Some providers hand out a set of environment variables that depends on the credential, rather
+than values the config can name in advance. A stdio server can opt into merging them:
 
-Getting a lease is part of a connection attempt. A server with `credentials` connects like
-this:
+```json
+"credentials": { "provider": "platform", "params": {}, "mergeEnv": true }
+```
 
-1. Get a lease, unless the current one is still usable.
-2. Expand the server's placeholders with it.
+With `mergeEnv`, every lease value is added to the server's environment and replaces any
+variable of the same name from `env`. Names must be valid environment variable names, and must
+not be in `hookEnv`, or the attempt fails, naming the bad key. The set of names can differ
+between leases, since rotating always restarts a stdio server. `mergeEnv` isn't available for
+HTTP servers, which must place values in headers explicitly.
+
+### Server states
+
+A server with `credentials` uses gate's existing states, plus one:
+
+| State | Meaning | Requests |
+|---|---|---|
+| `Attempting` | Getting a lease and connecting | Wait for the attempt |
+| `Pending` | Waiting to retry | Fail fast |
+| `Ready(g)` | Connection `g` is up, made with lease `L(g)` | Use connection `g` |
+| `Rotating(g)` | Replacing connection `g` | Wait for the new connection |
+| `Failed` | No usable connection | Fail, and trigger one new attempt, as today |
+
+Each server's connections are numbered: `g` starts at 1 and goes up by one with every new
+connection. Each server has one supervisor task, and every transition below happens in that
+task. A server makes at most one lease request at a time, and requests that arrive meanwhile
+wait for its result.
+
+### Connecting
+
+Getting a lease is the first step of a connection attempt:
+
+1. Ask the provider for a lease.
+   - `lease`: if its fingerprint has been rejected, the attempt fails with "the provider has
+     no other credential". Otherwise, continue.
+   - `transient`: the attempt fails, and the usual retry delays apply.
+   - `denied`: the attempt fails, and the server skips any remaining background attempts.
+     The next request that needs the server triggers one new attempt, as for any failed
+     server.
+2. Expand the server's placeholders with the lease, and merge it into the environment if
+   `mergeEnv` is set.
 3. Start the server or open the HTTP session, then list its tools, as today.
 
-A provider that fails is a failed attempt like any other, so the retry delays, background
-concurrency limit and request-triggered retries all apply unchanged. Each server's supervisor
-makes at most one lease request at a time, and requests that arrive meanwhile wait for its
-result, as they do for attempts today.
+### Refreshing
 
-Once a server is ready, its supervisor keeps the lease current:
+At `refreshAfter`, the supervisor of a `Ready(g)` server asks for a new lease:
 
-- **At `refreshAfter`**, it requests a new lease in the background. If the values haven't
-  changed, it just keeps the new `credentialId` and times. If they have, it rotates (below).
-  If the request fails, the current lease stays in use and the request is retried with the
-  usual delays until `expiresAt`.
-- **At `expiresAt`**, a server that still has no new lease stops being ready, and requests
-  fail fast until a lease arrives.
-- **Before each call**, gate checks `expiresAt` too, so a supervisor that wakes up late, for
-  example after the machine was suspended, can't use an expired lease.
+| Outcome | What happens |
+|---|---|
+| `lease`, same fingerprint | Replace `L(g)`'s ID, times and matchers, and keep connection `g` |
+| `lease`, new fingerprint | Rotate to the new lease |
+| `transient` | Keep `L(g)` until its `expiresAt`, asking again with the usual retry delays |
+| `denied` | [Revoke](#revoking) |
 
-Rotating replaces the connection:
+At `expiresAt`, if `L(g)` hasn't been replaced, the server revokes it. gate also checks
+`expiresAt` before every call, so a supervisor that wakes up late, for example after the
+machine was suspended, can't use an expired lease.
 
-1. The server's status becomes `Attempting`, so new requests wait for the new connection
-   instead of failing.
-2. Calls already running on the old connection get up to the call timeout to finish.
-3. The old connection is closed. Stdio servers are restarted, since their environment can't
+Keeping a lease through a `transient` failure is a deliberate choice. It rides out short
+outages, and the provider bounds it with `expiresAt`. A provider that wants every failed
+refresh to stop the server, like the TypeScript gateway does, sets `expiresAt` equal to
+`refreshAfter`.
+
+### Rotating
+
+Rotating replaces connection `g` with connection `g + 1`:
+
+1. The server becomes `Rotating(g)`. New requests wait instead of failing.
+2. Calls already running on connection `g` get up to `drainSeconds` to finish. That's 30
+   seconds by default, and never more than the call timeout. When the time is up, gate sends
+   the remaining calls `notifications/cancelled` and fails them with "interrupted while the
+   server's credentials were replaced; the downstream outcome is unknown".
+3. Connection `g` is closed. Stdio servers are restarted, since their environment can't
    change.
-4. The new connection is made with the new lease.
+4. Connection `g + 1` is made with the new lease, or with one the provider gives now if
+   rotation started from a rejection. If that fails, the server follows the usual rules for
+   failed attempts.
+5. Requests that waited check access again before they're sent (see
+   [Where gate applies it](#where-gate-applies-it)).
 
-gate closes the old connection before making the new one. Some stdio servers can't run twice
-at once, for example because of lock files, and a stale and a fresh connection should never
-serve the same request. Making the new connection first, for HTTP servers only, is an open
-question.
+gate closes the old connection before making the new one, for every transport. Some stdio
+servers can't run twice at once, for example because of lock files, and no request should be
+served by a connection made with a credential that's being replaced.
+
+### Revoking
+
+When a lease is denied or expires:
+
+1. The server becomes `Failed` at once, so no new call uses the lease.
+2. Calls already running get the same `drainSeconds` as when rotating, then are cancelled.
+3. The connection is closed.
 
 ### Auth failures
 
-gate recognizes a rejected credential in three ways:
+A call can show that its credential was rejected. gate looks for this in three built-in ways:
 
-1. **Transport**: the HTTP transport got a `401`, during connection or during a call. rmcp
-   reports these as `StreamableHttpError::AuthRequired`.
-2. **Result**: the result has `isError: true` and `structuredContent.status` is `401`.
-3. **Matchers from the lease**: each entry in `authFailures` matches a result whose only
-   content is one text block, optionally requiring `isError`, when its `text` regex matches
-   that text. Regexes use the `regex` crate, so they run in linear time. A lease may have at
-   most 32, each at most 1 KiB.
+1. **HTTP status.** The downstream server answered 401. rmcp reports a 401 as
+   `StreamableHttpError::AuthRequired` only if the response has a `WWW-Authenticate` header.
+   Otherwise it's a generic HTTP status error. gate reads the status from the error's source
+   chain before formatting anything, so it catches both, and is tested with and without the
+   header.
+2. **JSON-RPC error.** The error's `data.status` is 401.
+3. **Tool result.** The result has `isError: true` and its `structuredContent.status` is 401.
 
-Matchers come with each lease, not from the config, because the provider is what knows which
-server and version a credential is for. Vendor-specific patterns live with the provider, not
-in gate.
+Each lease can add more ways in `authFailures`. A matcher matches when every field it has
+matches:
 
-When a credential is rejected:
+| Field | Matches when |
+|---|---|
+| `isError` | The result's `isError` equals this |
+| `toolName` | This regex matches the name of the tool called |
+| `text` | The result has exactly one content block, it's text, and this regex matches it |
+| `json` | That one text block parses as JSON, and the string at `json.pointer` (a JSON Pointer) matches the regex `json.text` |
 
-- The call that saw it returns exactly what the server sent, or fails with the transport
-  error. It isn't retried, since the call may have had an effect.
-- The server's credential is marked rejected. The supervisor then rotates, requesting a new
-  lease with `rejectedCredentialId`.
-- If the provider returns the rejected `credentialId` again, the attempt fails with "the
-  provider has no other credential". The usual retry delays limit how often that can happen.
+Regexes use the `regex` crate, so they run in linear time. A lease may have at most 32
+matchers, and each regex may be at most 1 KiB. Matchers come with each lease, not from the
+config, because the provider knows which server and version a credential is for.
 
-### Keeping secrets contained
+### Attributing failures
 
-- Lease values are replaced with `<redacted>` in the server's forwarded stderr, in the stderr
-  tail added to connection errors, and in every error message gate produces. Values shorter
-  than 8 bytes aren't redacted, since they'd hide unrelated text and are rarely secrets.
-- Values are never logged, never included in `list_mcp_servers`, and never available to
-  `execute_mcp_code`.
-- The `${credential:…}` restriction above keeps them out of process listings and URLs.
+Calls can still be running when a lease changes, so a failure must be attributed to the
+credential that call used, not to whichever one is current:
+
+1. Every call records, when it's sent, its connection `g`, the fingerprint of `L(g)`, and
+   `L(g)`'s matchers.
+2. A call's result or error is checked with the matchers it recorded.
+3. A failure counts only if the call's fingerprint is still the current one, and only if no
+   recovery for that fingerprint has started yet. Otherwise it's logged and ignored. A late
+   failure can never invalidate a newer credential.
+4. The first failure that counts marks the fingerprint as rejected, and the server rotates,
+   asking for a lease with `rejectedCredentialId` set to `L(g)`'s ID. Any further failures for
+   the same fingerprint join that recovery.
+5. gate remembers the last 16 rejected fingerprints for as long as it runs.
+
+The call that saw the failure returns exactly what the server sent, or fails with the
+transport's error. **Calls are never replayed**, whatever happens, since they may already
+have taken effect.
 
 ## Access policies
 
@@ -258,23 +382,28 @@ Request:
 }
 ```
 
-`servers` lists every server that uses this policy and is relevant to the request, at most
-100 per call. If a policy covers more servers than that, gate makes several calls.
-
 Response:
 
 ```json
-{ "allowed": ["github"], "ttlSeconds": 0 }
+{ "allowed": ["github"] }
 ```
 
-`allowed` names the servers that may be used. Names that weren't in the request are ignored.
-`ttlSeconds` lets gate reuse the answer for that long. The default, `0`, means gate asks again
-for every request.
+Names that weren't in the request are ignored. Anything other than a valid answer, including
+errors, timeouts and HTTP statuses outside `2xx`, means nothing is allowed.
 
-If a policy sets `"includeMeta": true`, requests also carry `meta`: the `_meta` object of the
-MCP request being authorized. This is for gateways serving several callers, which identify
-themselves there. It's opt-in because `_meta` may hold things a policy has no need for, and
-answers are cached separately for each distinct `meta`.
+### No caching
+
+gate asks the policy for every request and never reuses an answer from an earlier request.
+The caller can change between requests without gate knowing, for example when a platform
+decides who the caller is from state on its side. Reusing a yes could give one caller
+another's access.
+
+Within one request, gate asks each policy exactly once, with every relevant server in a
+single call, and uses that answer for the whole request. A batch of 20 searches makes one
+call per policy, not 20, and is never split. A policy that can't handle that many servers
+should fail, which hides them all.
+
+Caching across requests is deferred (see [Deferred](#deferred)).
 
 ### Where gate applies it
 
@@ -284,39 +413,86 @@ A server whose policy doesn't allow it is treated as if it weren't configured:
 |---|---|
 | `list_mcp_servers` | Leaves it out |
 | `search_mcp_tools` | Leaves its tools out. Naming it in `serverIds` gives the usual "unknown server" error. |
-| `get_mcp_tool_details`, `call_mcp_tool` | "Unknown server". gate checks before waiting for a connection, and again before sending the call if it had to wait. |
-| `execute_mcp_code` | gate asks every policy once when the script starts, and only allowed servers can be called. Each call is checked again before it's sent, using `ttlSeconds` as usual. |
+| `get_mcp_tool_details`, `call_mcp_tool` | "Unknown server". gate checks before waiting for a connection, and again before sending the call if it had to wait, for example during a rotation. |
+| `execute_mcp_code` | See below |
 
-Each request asks all its policies in parallel, once per request. A batch of 20 searches
-makes one call per policy, not 20.
+For `execute_mcp_code`:
 
-Hiding a server doesn't stop gate from connecting to it in the background. Connecting doesn't
-need the caller's permission, and keeping it connected means the server is ready as soon as
-it's allowed. The search index covers every ready server, and policies are applied when
-results are selected, as `serverIds` is applied today, so they cost no rebuilds.
+1. When the script starts, gate asks every policy once. The servers allowed then are the
+   script's ceiling, and the script can never call any other.
+2. Before each of its calls is sent, gate asks the server's policy again, for that server
+   alone.
+
+So a script can't gain access while it runs, and loses access as soon as the policy stops
+allowing it. If the platform decides the script shouldn't finish at all, for example because
+another caller took over, it can cancel the MCP request. gate then cancels the script and its
+running calls, as today.
+
+Hiding a server doesn't stop gate from connecting to it in the background. The search index
+covers every ready server, and policies are applied when results are selected, as `serverIds`
+is today, so they never cause rebuilds.
 
 ### Failing closed
 
-If a policy errors or times out, gate treats every server it covers as not allowed for that
-request, and writes the error to gate's stderr. Servers that don't use the policy are
-unaffected. Agents don't see the error, since telling them a server exists but is hidden
-would reveal what the policy is there to hide.
+If a policy errors or times out, every server it covers is hidden for that request, and the
+error goes to gate's stderr. Servers that don't use the policy are unaffected. The agent
+doesn't see the error, since telling it a server exists but is hidden reveals what the policy
+is there to hide.
 
-## Environment isolation
+## Environment
 
-Servers inherit gate's whole environment today, which can include tokens meant only for
-hooks. Two changes fix that:
+### Variables for hooks only
 
-- **Variables that hooks use are removed.** Any variable named in an `env` placeholder in
-  `credentialProviders` or `accessPolicies` is removed from what servers inherit. A server
-  can still set it explicitly in its own `env`. This needs no configuration and covers the
-  common case.
-- **`inheritEnv` on a server** controls what else it inherits:
-  - `true` (the default) inherits everything, minus the variables above.
-  - `false` inherits nothing.
-  - a list of names, like `["PATH", "HOME"]`, inherits only those.
+`hookEnv` lists variables meant only for hooks, like the token a hook uses to reach the
+platform. They:
 
-Code workers already start with an empty environment, and that doesn't change.
+- are available to command hooks and to placeholders in hook configs
+- are never inherited by servers
+- can't be named in a server's `env` or `headers` placeholders. Config loading fails if they
+  are.
+
+A variable named in a placeholder in `credentialProviders` or `accessPolicies` is added to
+`hookEnv` automatically. That covers HTTP hooks without any setup. It doesn't cover command
+hooks, which can read any variable without naming it, so configs with command hooks should
+list theirs.
+
+### What servers inherit
+
+`inheritEnv`, at the top level or on a server, controls what servers inherit besides their own
+`env`:
+
+- `true` (the default) inherits everything except `hookEnv`.
+- `false` inherits nothing.
+- a list of names inherits only those.
+
+A server's setting overrides the top-level one. Platforms that launch gate with secrets in its
+environment should use a list, not rely on `hookEnv` alone. Code workers already start with an
+empty environment, and that doesn't change.
+
+### What this doesn't do
+
+These controls decide which variables gate hands each server. They don't isolate servers:
+every server runs as gate's user and can read whatever that user can, including gate's own
+`/proc/<pid>/environ` and any token files. Isolating servers from each other needs separate
+users or sandboxes, which are out of scope.
+
+## Secrets in diagnostics
+
+gate cleans its own output, in these ways:
+
+- Lease values are replaced with `<redacted>` in forwarded server stderr, in the stderr tail
+  added to connection errors, and in every error message gate writes.
+- Redaction covers the values of every lease whose connection is still open, including one
+  being drained during a rotation, until that connection closes.
+- Forwarded stderr is redacted as a stream, so a value split across two chunks is still
+  caught. gate holds back up to the longest value's length, minus one byte, before forwarding.
+- Values shorter than 8 bytes aren't redacted, since they'd hide unrelated text.
+- Hook stderr isn't forwarded unless a hook sets `"stderr": "forward"`.
+
+gate never logs lease values, never includes them in `list_mcp_servers`, and never gives them
+to `execute_mcp_code`. Tool results are passed through unchanged, so a server that returns its
+own credential in a result exposes it. That's covered by the [Trust model](#trust-model), not
+prevented.
 
 ## Rust API
 
@@ -329,7 +505,7 @@ pub trait CredentialProvider: Send + Sync + 'static {
         &'a self,
         request: CredentialRequest<'a>,
         ct: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<Lease, HookError>>;
+    ) -> BoxFuture<'a, CredentialOutcome>;
 }
 
 pub trait AccessPolicy: Send + Sync + 'static {
@@ -341,8 +517,9 @@ pub trait AccessPolicy: Send + Sync + 'static {
 }
 
 Gateway::builder(config)
-    .credential_provider("vault", MyProvider::new())
+    .credential_provider("platform", MyProvider::new())
     .access_policy("platform", MyPolicy::new())
+    .code_worker(CodeWorker::Executable("/usr/libexec/gate".into()))
     .serve(stdio())
     .await?;
 ```
@@ -351,6 +528,18 @@ The `http` and `command` transports implement these traits. A config entry names
 built-in transport or a hook registered with the builder, and config loading fails if a name
 is neither. The types mirror the JSON protocol, so moving a hook between a process and Rust
 doesn't change its behavior.
+
+### Code workers
+
+`execute_mcp_code` runs each script in a worker process. Today, gate starts the worker by
+running its own executable with `--code-worker`, which only works for the `gate` binary. A
+program that embeds gate has to choose:
+
+- `CodeWorker::Executable(path)` runs a `gate` binary installed at `path`.
+- `CodeWorker::CurrentExe` runs the host's own executable with `--code-worker`. The host must
+  then start by calling `gate::code::worker_main_if_requested()`, which runs the worker and
+  exits when that flag is first. This is what the `gate` binary does.
+- With neither, `execute_mcp_code` isn't offered.
 
 ## Alternatives considered
 
@@ -361,62 +550,107 @@ doesn't change its behavior.
   authors implement MCP to answer two questions.
 - **Dynamic plugins** (`.so` or WASM). A stable plugin ABI or WASM host is much more machinery
   than two small protocols, and the hooks aren't performance-sensitive enough to need it.
-- **Long-lived command hooks** speaking JSON-RPC, so hooks don't pay for a process start each
-  time. HTTP already covers hooks that must be fast, and per-request processes are simpler to
-  write and can't get stuck in a bad state. This can be added later as a third transport.
 - **Hooks that see every tool call**, for argument-level policies. That's a different, much
   larger feature, and per-server access covers the cases that motivated this.
+
+## Decisions
+
+| Question | Decision |
+|---|---|
+| Make the new connection before closing the old one, for HTTP servers? | No. Close first for every transport. |
+| Allow `${credential:…}` in `args`? | No. Wrap servers that need it in a script that reads the variable. |
+| Tell `list_mcp_servers` how many servers are hidden? | No. It says something about the policy. |
+| Policies that answer "read-only" and similar? | Deferred. The response format leaves room for it. |
+| Keep an unexpired lease when a refresh fails transiently? | Yes. Providers that don't want this set `expiresAt` equal to `refreshAfter`. |
+| Support HTTP+SSE servers? | No. rmcp has no client for this deprecated transport. |
+
+## Deferred
+
+These were considered and left out of the first version on purpose:
+
+- **Caching access answers.** If added, a cached answer must only be reused for the same
+  trusted caller generation, the same policy config and the same set of servers, and must
+  never be visible to another caller. gate has no trusted notion of the caller today, so this
+  needs one first, supplied by the policy.
+- **Passing `_meta` to policies.** It's caller-supplied, so it can only ever be context for
+  the policy to verify, never identity. It's worth adding when gate serves several callers
+  over HTTP.
+- **`${file:PATH}` placeholders** for tokens that rotate while gate runs. Nothing needs them
+  yet, and they make the token a request uses depend on when the file was read.
+- **Long-lived command hooks** speaking JSON-RPC, to avoid starting a process per request.
+  HTTP already covers hooks that must be fast.
 
 ## Plan
 
 Each step can be released on its own:
 
-1. **Groundwork**: split the library from the binary, add `${file:…}`, add environment
-   isolation, and make an invalid server fail only itself instead of the whole config. Each of
-   these is useful without hooks.
-2. **Hook transports and access policies**: the smaller hook, which gets the shared transport
+1. **Groundwork.** Split the library from the binary and make the code worker configurable,
+   add `hookEnv` and `inheritEnv`, and make an invalid server fail only itself instead of the
+   whole config. Each of these is useful without hooks.
+2. **Hook transports and access policies.** The smaller hook, which gets the shared transport
    code into use.
-3. **Credential providers**: leases, refresh and rotation in the supervisor, auth-failure
-   detection and redaction.
-4. **Public Rust API**: document and stabilize the traits once both hooks have settled.
+3. **Credential providers.** Outcomes, fingerprints, the server states above, attributing
+   failures, built-in and lease detectors, `mergeEnv` and redaction.
+4. **Public Rust API.** Document and stabilize the traits once both hooks have settled.
 
 Tests use the same approach as today's integration tests: hook servers built with axum,
 command hooks written as shell scripts, and echo MCP servers. They should cover at least:
 
-- requests that arrive mid-rotation wait for the new connection, and running calls finish
-- a rejected credential is never retried for the same call, and is reported on the next lease
-  request
-- a provider that keeps returning a rejected credential stops after the usual retries
-- secrets are redacted from stderr and errors, including when a connection fails
-- a policy that errors or times out hides only its own servers
-- hidden servers are indistinguishable from servers that aren't configured
-- scripts can't call servers that weren't allowed when they started
-- variables used by hooks never reach servers
+- each outcome, from each transport, while connecting, refreshing and rotating
+- `4xx` without a body revokes, while `5xx`, timeouts and malformed answers don't
+- requests that arrive during a rotation wait for the new connection, then check access again
+- running calls finish within `drainSeconds`, or are cancelled and reported as interrupted
+- a late failure from an old credential doesn't invalidate the new one
+- several failures for the same credential cause one rotation
+- a lease with rejected values is refused, even under a new `credentialId`
+- a refreshed lease's matchers replace the old ones
+- 401s are detected with and without `WWW-Authenticate`, from JSON-RPC errors and from
+  structured results
+- secrets are redacted from stderr, including across chunks and during a rotation
+- the policy is asked once per request, never answers from an earlier request, and hides only
+  its own servers when it fails
+- scripts can't call servers outside their ceiling, and lose servers the policy stops allowing
+- `hookEnv` variables never reach servers, and naming one in a server's config is an error
 
-## Open questions
+## Appendix A: how a hosted platform uses this
 
-1. Should HTTP servers make their new connection before closing the old one when rotating? It
-   avoids waiting, but briefly holds two sessions with two different credentials.
-2. Some servers only take a token as an argument. Should `${credential:…}` be allowed in
-   `args`, behind an explicit option, or should those servers be wrapped in a script instead?
-3. Should `list_mcp_servers` say how many servers are hidden, without naming them? It helps
-   explain why an expected server is missing, but it says something about the policy.
-4. Should an access policy be able to answer "allowed, but read-only" or similar? Nothing needs
-   it yet, and the response format leaves room to add it.
-
-## Appendix: how a hosted platform would use this
-
-The motivating case is an agent platform that runs gate in each sandbox (Tembo's, for one):
+The motivating case is an agent platform that runs gate in each sandbox, Tembo's among them:
 
 - Its API writes gate's config when the sandbox starts, with `params` carrying its own
-  integration and connection IDs.
+  integration and connection IDs, a `hookEnv` with its tokens, and an `inheritEnv` list for
+  its servers.
 - Its credential endpoint implements the credentials protocol. The vendor-specific error
-  patterns it keeps for each MCP server become `authFailures` in its leases.
-- Its access endpoint implements the access protocol. The bearer token identifies the user who
-  sent the current message, so the endpoint can allow only that user's personal connections.
-  The token changes with each message, so the platform writes it to a file and the policy
-  reads it with `${file:…}`.
-- The tokens for its endpoints are only named in hook configs, so environment isolation keeps
-  them away from servers without further setup.
+  patterns it knows for each MCP server become `authFailures` in its leases. It already
+  answers `403` and `404` when access is revoked, which gate classifies as `denied`.
+- Its access endpoint implements the access protocol. The sandbox's token stays the same for
+  the life of the agent process, and the platform decides on its side, for every request,
+  which message is active and who sent it. That's why gate asks for every request and never
+  caches the answer.
 
 None of this needs anything in gate that's specific to the platform.
+
+## Appendix B: replacing Tembo's TypeScript gateway
+
+This design gives gate what it needs, but switching Tembo's sandboxes from the TypeScript
+gateway to gate also needs work outside gate. Some of it is compatibility work, and some can
+be a deliberate change in behavior:
+
+| Work | What's needed |
+|---|---|
+| Hook endpoints | Adapt the existing credential and access endpoints, or put adapters in front of them. Their request and response formats differ from the ones here. |
+| Config and launch | Generate gate's config instead of the current manifest, and launch gate instead of the current gateway command |
+| Credential formats | Turn each existing auth-error format into lease `authFailures`, and use `mergeEnv` for stdio servers whose leased variables vary |
+| Code mode | gate runs JavaScript and returns `logs`, while the current gateway runs TypeScript and returns `stdout` and `stderr`. Either gate strips TypeScript types, or the tool's contract and agent prompts change. |
+| SSE servers | Move any remaining SSE servers to Streamable HTTP |
+| Gateway identity | Configure the server name, instructions and tool descriptions agents see today |
+
+Before switching, an acceptance suite should run the same scenarios against both gateways and
+check that they agree, except where a difference was chosen on purpose:
+
+- the active message changes between requests, and during a script
+- a sandbox or connection is revoked while servers are connected and calls are running
+- credentials are refreshed and rotated with calls running
+- every existing auth-error format, with both matching and nearly matching fixtures
+- what personal servers each caller sees, in every tool
+- which variables each server gets
+- code-mode scripts and their output
