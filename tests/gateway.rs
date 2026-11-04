@@ -55,10 +55,19 @@ impl Gateway {
         args: &[&str],
         stderr: Stdio,
     ) -> (Self, Option<ChildStderr>) {
+        Self::spawn_config(json!({ "mcpServers": servers }), env, args, stderr).await
+    }
+
+    async fn spawn_config(
+        configuration: Value,
+        env: &[(&str, &str)],
+        args: &[&str],
+        stderr: Stdio,
+    ) -> (Self, Option<ChildStderr>) {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("mcp.json");
         let empty_config = dir.path().join("empty.json");
-        std::fs::write(&config, json!({ "mcpServers": servers }).to_string()).unwrap();
+        std::fs::write(&config, configuration.to_string()).unwrap();
         std::fs::write(&empty_config, r#"{ "mcpServers": {} }"#).unwrap();
 
         let mut command = Command::new(GATE);
@@ -1676,4 +1685,966 @@ async fn makes_concurrent_calls_to_sse_servers() {
 #[tokio::test]
 async fn makes_concurrent_calls_to_json_servers() {
     makes_concurrent_http_calls(Responses::Json).await;
+}
+
+#[tokio::test]
+async fn controls_downstream_environments() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (json!({}), json!({}), "parent|parent||hook"),
+        (json!({"inheritEnv": false}), json!({}), "|||"),
+        (json!({"inheritEnv": []}), json!({}), "|||"),
+        (
+            json!({"inheritEnv": ["GATE_TEST_KEEP"]}),
+            json!({}),
+            "parent|||",
+        ),
+        (
+            json!({"inheritEnv": false}),
+            json!({"inheritEnv": true}),
+            "parent|parent||hook",
+        ),
+        (
+            json!({"inheritEnv": true}),
+            json!({"inheritEnv": false}),
+            "|||",
+        ),
+        (
+            json!({"inheritEnv": true}),
+            json!({"inheritEnv": ["GATE_TEST_KEEP"]}),
+            "parent|||",
+        ),
+        (
+            json!({"hookEnv": ["GATE_TEST_HOOK"]}),
+            json!({}),
+            "parent|parent||",
+        ),
+        (
+            json!({"hookEnv": ["GATE_TEST_HOOK"], "inheritEnv": ["GATE_TEST_KEEP", "GATE_TEST_HOOK"]}),
+            json!({}),
+            "parent|||",
+        ),
+        (
+            json!({"inheritEnv": false}),
+            json!({"env": {"GATE_TEST_KEEP": "explicit", "GATE_TEST_EXTRA": "extra"}}),
+            "explicit||extra|",
+        ),
+        (
+            json!({}),
+            json!({"env": {"GATE_TEST_KEEP": "explicit"}}),
+            "explicit|parent||hook",
+        ),
+    ];
+    for (i, (mut config, mut server, expected)) in cases.into_iter().enumerate() {
+        let output = dir.path().join(format!("env-{i}"));
+        server["command"] = json!("/bin/sh");
+        server["args"] = json!([
+            "-c",
+            r#"printf '%s|%s|%s|%s' "$GATE_TEST_KEEP" "$GATE_TEST_DROP" "$GATE_TEST_EXTRA" "$GATE_TEST_HOOK" > "$1"; exit 1"#,
+            "environment-test",
+            output,
+        ]);
+        config["mcpServers"] = json!({"probe": server});
+        let (gateway, _) = Gateway::spawn_config(
+            config,
+            &[
+                ("GATE_TEST_KEEP", "parent"),
+                ("GATE_TEST_DROP", "parent"),
+                ("GATE_TEST_EXTRA", ""),
+                ("GATE_TEST_HOOK", "hook"),
+            ],
+            &[],
+            Stdio::null(),
+        )
+        .await;
+        gateway.wait_for_status("probe", "failed").await;
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            expected,
+            "case {i}"
+        );
+    }
+}
+
+struct PolicyServer {
+    url: String,
+    answer: Arc<std::sync::Mutex<(StatusCode, String)>>,
+    requests: mpsc::UnboundedReceiver<Value>,
+}
+
+impl PolicyServer {
+    fn allow(&self, servers: &[&str]) {
+        *self.answer.lock().unwrap() = (StatusCode::OK, json!({"allowed": servers}).to_string());
+    }
+}
+
+type PolicyState = (
+    Arc<std::sync::Mutex<(StatusCode, String)>>,
+    mpsc::UnboundedSender<Value>,
+);
+
+async fn serve_policy() -> PolicyServer {
+    let answer = Arc::new(std::sync::Mutex::new((
+        StatusCode::OK,
+        json!({"allowed": []}).to_string(),
+    )));
+    let (sent, requests) = mpsc::unbounded_channel();
+    let state = (answer.clone(), sent);
+    let router = axum::Router::new()
+        .route(
+            "/access",
+            axum::routing::post(
+                |State((answer, sent)): State<PolicyState>,
+                 headers: axum::http::HeaderMap,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer policy-token");
+                    sent.send(body).unwrap();
+                    let (status, body) = answer.lock().unwrap().clone();
+                    (status, body)
+                },
+            ),
+        )
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/access", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    PolicyServer {
+        url,
+        answer,
+        requests,
+    }
+}
+
+fn protected(mut server: Value) -> Value {
+    server["access"] = json!({"policy": "platform", "params": {"connection": "c_123"}});
+    server
+}
+
+async fn policy_gateway(policy: &PolicyServer, servers: Value) -> Gateway {
+    Gateway::spawn_config(json!({
+        "accessPolicies": {"platform": {"http": {"url": policy.url, "headers": {"Authorization": "Bearer ${POLICY_TOKEN}"}}}},
+        "mcpServers": servers,
+    }), &[("POLICY_TOKEN", "policy-token"), TOKEN], &[], Stdio::inherit()).await.0
+}
+
+#[tokio::test]
+async fn access_changes_apply_to_discovery_details_and_calls() {
+    let mut policy = serve_policy().await;
+    let echo_server = serve_echo().await;
+    let gateway = policy_gateway(
+        &policy,
+        json!({"private": protected(echo(&echo_server.url)), "public": nested_gate()}),
+    )
+    .await;
+    gateway.wait_for_status("public", "ready").await;
+    assert_eq!(gateway.servers().await.as_array().unwrap().len(), 1);
+    let results = gateway
+        .search(json!([{}, {"serverIds": ["private"]}, {"serverIds": ["missing"]}]))
+        .await;
+    assert!(
+        found(&results[0])
+            .iter()
+            .all(|name| name.starts_with("public/"))
+    );
+    assert_eq!(results[1]["error"], "unknown server `private`");
+    assert_eq!(results[2]["error"], "unknown server `missing`");
+    assert_eq!(
+        gateway
+            .details(json!([{"serverId":"private", "toolName":"echo"}]))
+            .await[0]["error"],
+        "unknown server `private`"
+    );
+    assert_eq!(
+        gateway
+            .call(
+                "call_mcp_tool",
+                json!({"serverId":"private", "toolName":"echo"})
+            )
+            .await,
+        (json!("unknown server `private`"), true)
+    );
+
+    policy.allow(&["private", "not-configured"]);
+    gateway.wait_for_status("private", "ready").await;
+    while policy.requests.try_recv().is_ok() {}
+    let searches = gateway
+        .search(json!([{"serverIds":["private"]}, {"serverIds":["private"]}]))
+        .await;
+    assert_eq!(searches.len(), 2);
+    let request = policy.requests.try_recv().unwrap();
+    assert_eq!(
+        request,
+        json!({"version":1,"kind":"access","servers":[{"server":"private","params":{"connection":"c_123"}}]})
+    );
+    assert!(
+        policy.requests.try_recv().is_err(),
+        "one policy request for the batch"
+    );
+    assert_eq!(
+        gateway
+            .details(json!([{"serverId":"private", "toolName":"echo"}]))
+            .await[0]["tool"]["name"],
+        "echo"
+    );
+    assert_eq!(
+        gateway
+            .call(
+                "call_mcp_tool",
+                json!({"serverId":"private", "toolName":"echo"})
+            )
+            .await,
+        (json!("echo"), false)
+    );
+
+    for (status, body) in [
+        (StatusCode::OK, "not JSON".to_string()),
+        (StatusCode::OK, json!({"allowed": "private"}).to_string()),
+        (
+            StatusCode::FORBIDDEN,
+            json!({"allowed":["private"]}).to_string(),
+        ),
+        (StatusCode::OK, "x".repeat(65537)),
+    ] {
+        *policy.answer.lock().unwrap() = (status, body);
+        assert_eq!(gateway.servers().await.as_array().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn scripts_lose_access_and_cannot_gain_servers() {
+    let policy = serve_policy().await;
+    policy.allow(&["private"]);
+    let mut server = serve_echo().await;
+    let gateway = policy_gateway(
+        &policy,
+        json!({
+            "private": protected(echo(&server.url)),
+            "new": protected(echo(&server.url)),
+        }),
+    )
+    .await;
+    gateway.wait_for_status("private", "ready").await;
+    let call = gateway
+        .start_call(
+            "execute_mcp_code",
+            json!({"code": r#"
+        await mcp.private.held({n:1});
+        const errors = [];
+        for (const id of ["private", "new"]) {
+            try { await mcp.call(id, "echo"); errors.push("unexpected success"); }
+            catch (error) { errors.push(error.message); }
+        }
+        return errors;
+    "#}),
+        )
+        .await;
+    assert_eq!(server.next_event().await, Event::Started);
+    policy.allow(&["new"]);
+    server.release.send_replace(true);
+    let (output, error) = finish_call(call).await;
+    assert!(!error, "{output}");
+    assert_eq!(
+        output["result"],
+        json!(["unknown server `private`", "unknown server `new`"])
+    );
+}
+
+#[tokio::test]
+async fn checks_access_again_after_waiting_for_a_connection() {
+    let mut policy = serve_policy().await;
+    policy.allow(&["private"]);
+    let mut server = serve_echo().await;
+    server.open.send_replace(false);
+    let gateway = policy_gateway(&policy, json!({"private": protected(echo(&server.url))})).await;
+    let call = gateway
+        .start_call(
+            "call_mcp_tool",
+            json!({"serverId":"private", "toolName":"sleep"}),
+        )
+        .await;
+    timeout(Duration::from_secs(5), policy.requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // Let the first answer reach the gateway while the connection remains held.
+    sleep(Duration::from_millis(100)).await;
+    policy.allow(&[]);
+    server.open.send_replace(true);
+    assert_eq!(
+        finish_call(call).await,
+        (json!("unknown server `private`"), true)
+    );
+    assert_eq!(server.remaining_events().await, []);
+}
+
+#[tokio::test]
+async fn command_policies_fail_closed_and_hide_their_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let captured = dir.path().join("inherited");
+    let response = dir.path().join("response");
+    let request = dir.path().join("request");
+    std::fs::write(&response, json!({"allowed":["private"]}).to_string()).unwrap();
+    let gateway = Gateway::spawn_config(json!({
+        "accessPolicies": {"platform": {
+            "command":"/bin/sh", "args":["-c", "cat > \"$REQUEST\"; test \"$HOOK_SECRET\" = dummy || exit 1; cat \"$RESPONSE\""],
+            "env": {"HOOK_SECRET":"${POLICY_SECRET}", "REQUEST":request, "RESPONSE":response},
+        }},
+        "mcpServers": {"private":protected({
+            let mut server = script(r#"printf '%s' "$POLICY_SECRET" > "$CAPTURED"; exec "$GATE" --config "$EMPTY_CONFIG""#);
+            server["env"] = json!({"CAPTURED": captured});
+            server
+        })},
+    }), &[("POLICY_SECRET","dummy")], &[], Stdio::inherit()).await.0;
+    gateway.wait_for_status("private", "ready").await;
+    assert_eq!(std::fs::read_to_string(captured).unwrap(), "");
+    let sent: Value = serde_json::from_str(&std::fs::read_to_string(request).unwrap()).unwrap();
+    assert_eq!(sent["kind"], "access");
+    std::fs::write(response, "secret-invalid-answer").unwrap();
+    assert_eq!(gateway.servers().await, json!([]));
+}
+
+fn credential_lease(
+    id: &str,
+    values: Value,
+    refresh_ms: Option<i64>,
+    expires_ms: Option<i64>,
+) -> Value {
+    let mut lease = json!({"outcome":"lease","credentialId":id,"values":values});
+    if let Some(ms) = refresh_ms {
+        lease["refreshAfter"] = json!(chrono::Utc::now() + chrono::Duration::milliseconds(ms));
+    }
+    if let Some(ms) = expires_ms {
+        lease["expiresAt"] = json!(chrono::Utc::now() + chrono::Duration::milliseconds(ms));
+    }
+    lease
+}
+impl PolicyServer {
+    fn credentials(&self, answer: Value) {
+        *self.answer.lock().unwrap() = (StatusCode::OK, answer.to_string());
+    }
+    async fn next_request(&mut self) -> Value {
+        timeout(Duration::from_secs(5), self.requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+fn leased(mut server: Value) -> Value {
+    server["credentials"] = json!({"provider":"p","params":{"connection":"c_123"}});
+    server
+}
+async fn credential_gateway(
+    provider: &PolicyServer,
+    servers: Value,
+    failure: &str,
+    drain: u64,
+) -> Gateway {
+    Gateway::spawn_config(json!({
+        "credentialProviders":{"p":{"http":{"url":provider.url,"headers":{"Authorization":"Bearer policy-token"}},"refreshFailure":failure,"drainSeconds":drain}},
+        "mcpServers":servers
+    }), &[TOKEN], &[], Stdio::inherit()).await.0
+}
+fn tool_call(tool: &str) -> Value {
+    json!({"serverId":"s","toolName":tool,"arguments":{}})
+}
+
+#[tokio::test]
+async fn credentials_refresh_same_values_without_interrupting_calls() {
+    let mut provider = serve_policy().await;
+    provider.credentials(credential_lease(
+        "one",
+        json!({"token":"test-token"}),
+        Some(500),
+        Some(900),
+    ));
+    let mut server = serve_echo().await;
+    let gateway=credential_gateway(&provider,json!({"s":leased(json!({"url":server.url,"headers":{"Authorization":"Bearer ${credential:token}"}}))}),"keep",1).await;
+    gateway.wait_for_status("s", "ready").await;
+    assert_eq!(
+        provider.next_request().await,
+        json!({"version":1,"kind":"credentials","server":"s","params":{"connection":"c_123"}})
+    );
+    let running = gateway
+        .start_call(
+            "call_mcp_tool",
+            json!({"serverId":"s","toolName":"held","arguments":{"n":7}}),
+        )
+        .await;
+    assert_eq!(server.next_event().await, Event::Started);
+    provider.credentials(credential_lease(
+        "one",
+        json!({"token":"test-token"}),
+        None,
+        None,
+    ));
+    provider.next_request().await;
+    sleep(Duration::from_millis(600)).await; // beyond the original hard expiry
+    server.release.send_replace(true);
+    let (result, error) = finish_call(running).await;
+    assert!(!error, "{result}");
+    assert!(server.events.try_recv().is_err());
+    assert_eq!(gateway.servers().await[0]["status"], "ready");
+}
+
+#[tokio::test]
+async fn transient_refresh_keeps_until_expiry_but_revoke_stops_immediately() {
+    for failure in ["keep", "revoke"] {
+        let mut provider = serve_policy().await;
+        provider.credentials(credential_lease("one", json!({}), Some(400), Some(1300)));
+        let gateway =
+            credential_gateway(&provider, json!({"s":leased(nested_gate())}), failure, 0).await;
+        gateway.wait_for_status("s", "ready").await;
+        provider.next_request().await;
+        provider.credentials(json!({"outcome":"transient"}));
+        provider.next_request().await;
+        sleep(Duration::from_millis(100)).await;
+        if failure == "keep" {
+            assert_eq!(gateway.servers().await[0]["status"], "ready");
+            let (_, error) = gateway
+                .call("call_mcp_tool", tool_call("list_mcp_servers"))
+                .await;
+            assert!(!error);
+        }
+        gateway.wait_for_status("s", "failed").await;
+        let (_, error) = gateway
+            .call("call_mcp_tool", tool_call("list_mcp_servers"))
+            .await;
+        assert!(error);
+    }
+}
+
+#[tokio::test]
+async fn rotation_drains_calls_waits_and_never_replays() {
+    for drain in [0, 2] {
+        let mut provider = serve_policy().await;
+        provider.credentials(credential_lease(
+            "one",
+            json!({"token":"test-token","generation":"first"}),
+            Some(400),
+            None,
+        ));
+        let mut server = serve_echo().await;
+        let gateway=credential_gateway(&provider,json!({"s":leased(json!({"url":server.url,"headers":{"Authorization":"Bearer ${credential:token}"}}))}),"keep",drain).await;
+        gateway.wait_for_status("s", "ready").await;
+        provider.next_request().await;
+        let running = gateway
+            .start_call(
+                "call_mcp_tool",
+                json!({"serverId":"s","toolName":"held","arguments":{"n":9}}),
+            )
+            .await;
+        assert_eq!(server.next_event().await, Event::Started);
+        provider.credentials(credential_lease(
+            "two",
+            json!({"token":"test-token","generation":"second"}),
+            None,
+            None,
+        ));
+        provider.next_request().await;
+        if drain > 0 {
+            gateway.wait_for_status("s", "connecting").await;
+            let waiting = gateway.start_call("call_mcp_tool", tool_call("echo")).await;
+            server.release.send_replace(true);
+            let (result, error) = finish_call(running).await;
+            assert!(!error, "{result}");
+            let (result, error) = finish_call(waiting).await;
+            assert!(!error, "{result}");
+        } else {
+            let (result, error) = finish_call(running).await;
+            assert!(
+                error && result.to_string().contains("downstream outcome is unknown"),
+                "{result}"
+            );
+            assert_eq!(server.next_event().await, Event::Cancelled);
+        }
+        gateway.wait_for_status("s", "ready").await;
+        assert!(server.events.try_recv().is_err(), "calls must not replay");
+    }
+}
+
+#[tokio::test]
+async fn credential_provider_http_statuses_take_precedence_over_body() {
+    for code in [401, 403, 404, 410, 408, 429, 500, 200] {
+        let mut provider = serve_policy().await;
+        *provider.answer.lock().unwrap() = (
+            StatusCode::from_u16(code).unwrap(),
+            if code == 200 {
+                "malformed".into()
+            } else {
+                credential_lease("one", json!({}), None, None).to_string()
+            },
+        );
+        let gateway =
+            credential_gateway(&provider, json!({"s":leased(nested_gate())}), "keep", 0).await;
+        let server = gateway.wait_for_status("s", "failed").await;
+        let denied = matches!(code, 401 | 403 | 404 | 410);
+        assert_eq!(
+            server["error"].as_str().unwrap().contains("denied"),
+            denied,
+            "{server}"
+        );
+        let mut requests = 0;
+        while provider.requests.try_recv().is_ok() {
+            requests += 1;
+        }
+        assert_eq!(requests, if denied { 1 } else { 3 });
+    }
+}
+
+#[tokio::test]
+async fn command_credentials_merge_rotate_and_redact_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let answer = dir.path().join("answer");
+    let observed = dir.path().join("observed");
+    let request = dir.path().join("request");
+    std::fs::write(
+        &answer,
+        credential_lease(
+            "one",
+            json!({"SECRET":"first-secret-value","OLD":"old-value"}),
+            Some(500),
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let configuration = json!({
+        "hookEnv":["HOOK_SECRET"],
+        "credentialProviders":{"p":{"command":"/bin/sh","args":["-c","cat > \"$REQUEST\"; cat \"$ANSWER\""],"env":{"REQUEST":request,"ANSWER":answer},"drainSeconds":0}},
+        "mcpServers":{"s":{"command":"/bin/sh","args":["-c","printf '%s|%s|%s\\n' \"$SECRET\" \"${OLD-unset}\" \"${NEW-unset}\" >> \"$OBSERVED\"; printf 'first-' >&2; sleep 0.02; printf 'secret-value\\n' >&2; exec \"$GATE\" --config \"$EMPTY_CONFIG\""],"env":{"OBSERVED":observed},"credentials":{"provider":"p","mergeEnv":true}}}
+    });
+    let (gateway, stderr) = Gateway::spawn_config(
+        configuration,
+        &[("HOOK_SECRET", "only-hooks")],
+        &[],
+        Stdio::piped(),
+    )
+    .await;
+    let mut lines = BufReader::new(stderr.unwrap()).lines();
+    gateway.wait_for_status("s", "ready").await;
+    let first = timeout(Duration::from_secs(3), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        first.contains("<redacted>") && !first.contains("first-secret-value"),
+        "{first}"
+    );
+    std::fs::write(
+        &answer,
+        credential_lease(
+            "two",
+            json!({"SECRET":"second-secret-value","NEW":"new-value"}),
+            None,
+            None,
+        )
+        .to_string(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let text = std::fs::read_to_string(&observed).unwrap();
+            if text.lines().count() >= 2 {
+                assert_eq!(
+                    text,
+                    "first-secret-value|old-value|unset\nsecond-secret-value|unset|new-value\n"
+                );
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    gateway.wait_for_status("s", "ready").await;
+    let body: Value = serde_json::from_str(&std::fs::read_to_string(request).unwrap()).unwrap();
+    assert_eq!(body["kind"], "credentials");
+}
+
+/// Minimal stateless MCP server for testing HTTP status and JSON-RPC attribution independently.
+async fn auth_server(
+    method: &'static str,
+    variant: &'static str,
+) -> (String, mpsc::UnboundedReceiver<(String, String)>) {
+    let (sent, requests) = mpsc::unbounded_channel();
+    let router=axum::Router::new().route("/mcp",axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+        let sent=sent.clone();
+        async move {
+            let token=headers.get("authorization").and_then(|h|h.to_str().ok()).unwrap_or("").to_owned();
+            let name=body["method"].as_str().unwrap_or("");
+            let _=sent.send((name.to_owned(),token.clone()));
+            if body.get("id").is_none() { return StatusCode::ACCEPTED.into_response(); }
+            let id=body["id"].clone();
+            if name==method && token=="Bearer bad-secret-token" {
+                let error=json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"authentication failed"}});
+                return match variant {
+                    "plain" => (StatusCode::UNAUTHORIZED,"no").into_response(),
+                    "challenge" => (StatusCode::UNAUTHORIZED,[("www-authenticate","Bearer")],"no").into_response(),
+                    "rpc" => (StatusCode::UNAUTHORIZED,axum::Json(error)).into_response(),
+                    "data" => { let mut error=error; error["error"]["data"]=json!({"status":401}); axum::Json(error).into_response() }
+                    "structured" => axum::Json(json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"structuredContent":{"status":401},"content":[{"type":"text","text":"rejected"}]}})).into_response(),
+                    "matcher" => axum::Json(json!({"jsonrpc":"2.0","id":id,"result":{"isError":true,"content":[{"type":"text","text":"vendor authentication failure"}]}})).into_response(),
+                    _ => unreachable!(),
+                };
+            }
+            let result=match name {
+                "initialize" => json!({"protocolVersion":body["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"auth-test","version":"1"}}),
+                "tools/list" => json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
+                "tools/call" => json!({"content":[{"type":"text","text":"ok"}]}),
+                _ => return axum::Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"unknown method"}})).into_response(),
+            };
+            axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, requests)
+}
+
+#[tokio::test]
+async fn auth_failures_during_setup_and_calls_are_attributed_without_replay() {
+    for method in ["initialize", "tools/list", "tools/call"] {
+        for variant in ["plain", "challenge", "rpc", "data", "structured", "matcher"] {
+            if method != "tools/call" && matches!(variant, "structured" | "matcher") {
+                continue;
+            }
+            let (url, mut downstream) = auth_server(method, variant).await;
+            let mut provider = serve_policy().await;
+            let mut initial =
+                credential_lease("one", json!({"token":"bad-secret-token"}), None, None);
+            initial["authFailures"] =
+                json!([{"isError":true,"text":"^vendor authentication failure$"}]);
+            provider.credentials(initial);
+            let gateway=credential_gateway(&provider,json!({"s":leased(json!({"url":url,"headers":{"Authorization":"Bearer ${credential:token}"}}))}),"keep",0).await;
+            provider.next_request().await;
+            if method == "tools/call" {
+                gateway.wait_for_status("s", "ready").await;
+                provider.credentials(credential_lease(
+                    "two",
+                    json!({"token":"good-secret-token"}),
+                    None,
+                    None,
+                ));
+                let (result, error) = gateway.call("call_mcp_tool", tool_call("echo")).await;
+                assert!(
+                    !result.to_string().contains("interrupted"),
+                    "{variant}: {result}"
+                );
+                // The failing call is surfaced, never retried with the new credential.
+                assert!(
+                    error
+                        || result.to_string().contains("rejected")
+                        || result.to_string().contains("vendor authentication failure"),
+                    "{method} {variant}: {result}"
+                );
+                let refresh = provider.next_request().await;
+                assert_eq!(refresh["rejectedCredentialId"], "one", "{method} {variant}");
+                gateway.wait_for_status("s", "ready").await;
+            } else {
+                let state = gateway.wait_for_status("s", "failed").await;
+                assert!(
+                    state["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no other credential"),
+                    "{method} {variant}: {state}"
+                );
+                assert_eq!(
+                    provider.next_request().await["rejectedCredentialId"],
+                    "one",
+                    "{method} {variant}"
+                );
+                while provider.requests.try_recv().is_ok() {}
+                provider.credentials(credential_lease(
+                    "two",
+                    json!({"token":"good-secret-token"}),
+                    None,
+                    None,
+                ));
+                let (result, error) = gateway.call("call_mcp_tool", tool_call("echo")).await;
+                assert!(!error, "{method} {variant}: {result}");
+                assert_eq!(provider.next_request().await["rejectedCredentialId"], "one");
+            }
+            let mut failures = 0;
+            while let Ok((name, token)) = downstream.try_recv() {
+                if name == method && token == "Bearer bad-secret-token" {
+                    failures += 1;
+                }
+            }
+            assert_eq!(
+                failures, 1,
+                "rejected values must not be dispatched again: {method} {variant}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn leases_expiring_during_drain_or_setup_are_replaced() {
+    for during_setup in [false, true] {
+        let mut provider = serve_policy().await;
+        let mut server = serve_echo().await;
+        if during_setup {
+            server.open.send_replace(false);
+        }
+        provider.credentials(credential_lease(
+            "one",
+            json!({"token":"test-token"}),
+            if during_setup { None } else { Some(400) },
+            if during_setup { Some(500) } else { None },
+        ));
+        let gateway=credential_gateway(&provider,json!({"s":leased(json!({"url":server.url,"headers":{"Authorization":"Bearer ${credential:token}"}}))}),"keep",2).await;
+        provider.next_request().await;
+        let running = if during_setup {
+            None
+        } else {
+            gateway.wait_for_status("s", "ready").await;
+            let running = gateway
+                .start_call(
+                    "call_mcp_tool",
+                    json!({"serverId":"s","toolName":"held","arguments":{"n":1}}),
+                )
+                .await;
+            assert_eq!(server.next_event().await, Event::Started);
+            provider.credentials(credential_lease(
+                "two",
+                json!({"token":"test-token","v":"short-lived"}),
+                None,
+                Some(650),
+            ));
+            provider.next_request().await;
+            gateway.wait_for_status("s", "connecting").await;
+            Some(running)
+        };
+        sleep(Duration::from_millis(750)).await;
+        provider.credentials(credential_lease(
+            "three",
+            json!({"token":"test-token","v":"fresh"}),
+            None,
+            None,
+        ));
+        server.open.send_replace(true);
+        server.release.send_replace(true);
+        if let Some(running) = running {
+            assert!(!finish_call(running).await.1);
+        }
+        provider.next_request().await;
+        gateway.wait_for_status("s", "ready").await;
+        assert!(!gateway.call("call_mcp_tool", tool_call("echo")).await.1);
+    }
+}
+
+#[tokio::test]
+async fn refresh_denial_cancels_running_calls_and_waits_for_demand() {
+    let mut provider = serve_policy().await;
+    provider.credentials(credential_lease("one", json!({}), Some(400), None));
+    let mut server = serve_echo().await;
+    let gateway =
+        credential_gateway(&provider, json!({"s":leased(echo(&server.url))}), "keep", 0).await;
+    gateway.wait_for_status("s", "ready").await;
+    provider.next_request().await;
+    let running = gateway
+        .start_call("call_mcp_tool", tool_call("sleep"))
+        .await;
+    assert_eq!(server.next_event().await, Event::Started);
+    provider.credentials(json!({"outcome":"denied"}));
+    provider.next_request().await;
+    assert!(finish_call(running).await.1);
+    assert_eq!(server.next_event().await, Event::Cancelled);
+    gateway.wait_for_status("s", "failed").await;
+    sleep(Duration::from_millis(100)).await;
+    assert!(provider.requests.try_recv().is_err());
+    provider.credentials(credential_lease("two", json!({}), None, None));
+    assert!(!gateway.call("call_mcp_tool", tool_call("echo")).await.1);
+    provider.next_request().await;
+}
+
+#[tokio::test]
+async fn same_value_refresh_replaces_matchers_and_rejected_values_cannot_be_renamed() {
+    let (url, mut downstream) = auth_server("tools/call", "matcher").await;
+    let mut provider = serve_policy().await;
+    provider.credentials(credential_lease(
+        "one",
+        json!({"token":"bad-secret-token"}),
+        Some(500),
+        None,
+    ));
+    let gateway=credential_gateway(&provider,json!({"s":leased(json!({"url":url,"headers":{"Authorization":"Bearer ${credential:token}"}})),"other":leased(nested_gate())}),"keep",0).await;
+    gateway.wait_for_status("s", "ready").await;
+    gateway.wait_for_status("other", "ready").await;
+    while provider.requests.try_recv().is_ok() {}
+    // This vendor error is not recognized until the lease supplies its detector.
+    gateway.call("call_mcp_tool", tool_call("echo")).await;
+    assert_eq!(
+        gateway
+            .servers()
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["serverId"] == "s")
+            .unwrap()["status"],
+        "ready"
+    );
+    let mut replacement = credential_lease("one", json!({"token":"bad-secret-token"}), None, None);
+    replacement["authFailures"] =
+        json!([{"isError":true,"text":"^vendor authentication failure$"}]);
+    provider.credentials(replacement);
+    loop {
+        if provider.next_request().await["server"] == "s" {
+            break;
+        }
+    }
+    sleep(Duration::from_millis(100)).await;
+    provider.credentials(credential_lease(
+        "renamed",
+        json!({"token":"bad-secret-token"}),
+        None,
+        None,
+    ));
+    gateway.call("call_mcp_tool", tool_call("echo")).await;
+    let failed = gateway.wait_for_status("s", "failed").await;
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("no other credential")
+    );
+    // Rejection memory is per server, even with the same provider and values.
+    assert!(
+        !gateway
+            .call(
+                "call_mcp_tool",
+                json!({"serverId":"other","toolName":"list_mcp_servers","arguments":{}})
+            )
+            .await
+            .1
+    );
+    let mut calls = 0;
+    while let Ok((method, _)) = downstream.try_recv() {
+        if method == "tools/call" {
+            calls += 1;
+        }
+    }
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn concurrent_rejections_join_one_recovery() {
+    let mut provider = serve_policy().await;
+    let mut initial = credential_lease("one", json!({"generation":"one"}), None, None);
+    initial["authFailures"] = json!([{"isError":false,"text":"^9$"}]);
+    provider.credentials(initial);
+    let mut server = serve_echo().await;
+    let gateway =
+        credential_gateway(&provider, json!({"s":leased(echo(&server.url))}), "keep", 2).await;
+    gateway.wait_for_status("s", "ready").await;
+    provider.next_request().await;
+    let mut calls = Vec::new();
+    for _ in 0..3 {
+        calls.push(
+            gateway
+                .start_call(
+                    "call_mcp_tool",
+                    json!({"serverId":"s","toolName":"held","arguments":{"n":9}}),
+                )
+                .await,
+        );
+        assert_eq!(server.next_event().await, Event::Started);
+    }
+    provider.credentials(credential_lease(
+        "two",
+        json!({"generation":"two"}),
+        None,
+        None,
+    ));
+    server.release.send_replace(true);
+    for call in calls {
+        assert!(!finish_call(call).await.1);
+    }
+    assert_eq!(provider.next_request().await["rejectedCredentialId"], "one");
+    gateway.wait_for_status("s", "ready").await;
+    sleep(Duration::from_millis(100)).await;
+    assert!(provider.requests.try_recv().is_err());
+    assert!(server.events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn rotation_waiters_recheck_access_before_dispatch() {
+    let mut provider = serve_policy().await;
+    let mut policy = serve_policy().await;
+    policy.allow(&["s"]);
+    provider.credentials(credential_lease(
+        "one",
+        json!({"generation":"one"}),
+        Some(400),
+        None,
+    ));
+    let mut server = serve_echo().await;
+    let mut downstream = leased(echo(&server.url));
+    downstream["access"] = json!({"policy":"p"});
+    let gateway=Gateway::spawn_config(json!({
+        "credentialProviders":{"p":{"http":{"url":provider.url,"headers":{"Authorization":"Bearer policy-token"}},"drainSeconds":2}},
+        "accessPolicies":{"p":{"http":{"url":policy.url,"headers":{"Authorization":"Bearer policy-token"}}}},
+        "mcpServers":{"s":downstream}
+    }),&[TOKEN],&[],Stdio::inherit()).await.0;
+    gateway.wait_for_status("s", "ready").await;
+    provider.next_request().await;
+    let running = gateway
+        .start_call(
+            "call_mcp_tool",
+            json!({"serverId":"s","toolName":"held","arguments":{"n":1}}),
+        )
+        .await;
+    assert_eq!(server.next_event().await, Event::Started);
+    provider.credentials(credential_lease(
+        "two",
+        json!({"generation":"two"}),
+        None,
+        None,
+    ));
+    provider.next_request().await;
+    gateway.wait_for_status("s", "connecting").await;
+    while policy.requests.try_recv().is_ok() {}
+    let waiting = gateway.start_call("call_mcp_tool", tool_call("echo")).await;
+    policy.next_request().await;
+    sleep(Duration::from_millis(100)).await;
+    policy.allow(&[]);
+    server.release.send_replace(true);
+    assert!(!finish_call(running).await.1);
+    let (result, error) = finish_call(waiting).await;
+    assert!(
+        error && result.to_string().contains("unknown server"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn leased_secrets_are_redacted_from_connection_errors_and_merged_keys_are_validated() {
+    for invalid_key in [None, Some("HOOK_ONLY"), Some("BAD-NAME")] {
+        let provider = serve_policy().await;
+        let values = match invalid_key {
+            Some(key) => json!({key:"secret-that-must-not-leak"}),
+            None => json!({"TOKEN":"secret-that-must-not-leak"}),
+        };
+        provider.credentials(credential_lease("one", values, None, None));
+        let configuration = json!({
+            "hookEnv":["HOOK_ONLY"],
+            "credentialProviders":{"p":{"http":{"url":provider.url,"headers":{"Authorization":"Bearer policy-token"}}}},
+            "mcpServers":{"s":{"command":"/bin/sh","args":["-c","printf '%s\\n' \"$TOKEN\" >&2; exit 1"],"credentials":{"provider":"p","mergeEnv":true}}}
+        });
+        let gateway = Gateway::spawn_config(configuration, &[], &[], Stdio::null())
+            .await
+            .0;
+        let state = gateway.wait_for_status("s", "failed").await;
+        let error = state["error"].as_str().unwrap();
+        assert!(!error.contains("secret-that-must-not-leak"), "{error}");
+        if let Some(key) = invalid_key {
+            assert!(error.contains(key), "{error}");
+        } else {
+            assert!(error.contains("<redacted>"), "{error}");
+        }
+    }
 }

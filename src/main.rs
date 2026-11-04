@@ -1,10 +1,15 @@
+mod access;
 mod code;
 mod config;
+mod credential_http;
+mod credentials;
+mod hooks;
+mod redaction;
 mod registry;
 mod search;
 mod spawn;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use rmcp::{
@@ -134,11 +139,13 @@ struct Gate {
 #[tool_router]
 impl Gate {
     #[tool(description = "List the configured MCP servers")]
-    async fn list_mcp_servers(&self) -> String {
+    async fn list_mcp_servers(&self, ct: CancellationToken) -> String {
+        let allowed = self.registry.allowed(None, &ct).await;
         let servers: Vec<_> = self
             .config
             .servers
             .iter()
+            .filter(|(id, _)| allowed.contains(*id))
             .map(|(id, server)| {
                 let mut entry = json!({ "serverId": id, "transport": server.transport.kind() });
                 if let Some(description) = &server.description {
@@ -146,7 +153,7 @@ impl Gate {
                 }
                 match self.registry.status(id) {
                     // Errors are only shown once every attempt has failed
-                    Some(Status::Attempting(_) | Status::Pending) | None => {
+                    Some(Status::Attempting(_) | Status::Rotating(_) | Status::Pending) | None => {
                         entry["status"] = "connecting".into();
                     }
                     Some(Status::Ready(connection)) => {
@@ -168,6 +175,7 @@ impl Gate {
     async fn search_mcp_tools(
         &self,
         Parameters(SearchMcpTools { searches }): Parameters<SearchMcpTools>,
+        ct: CancellationToken,
     ) -> Result<String, String> {
         if !(1..=MAX_BATCH).contains(&searches.len()) {
             return Err(format!(
@@ -183,6 +191,17 @@ impl Gate {
                 "`maxResults` must be between 1 and {MAX_SEARCH_RESULTS}"
             ));
         }
+        let requested = if searches.iter().all(|search| search.server_ids.is_some()) {
+            Some(
+                searches
+                    .iter()
+                    .flat_map(|search| search.server_ids.iter().flatten().cloned())
+                    .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
+        let allowed = self.registry.allowed(requested.as_ref(), &ct).await;
         // One index for the whole batch, so every search sees the same servers and tools
         let index = self.search.get(|| self.registry.catalog()).await?;
         let results: Vec<_> = searches
@@ -190,7 +209,16 @@ impl Gate {
             .map(|search| {
                 let query = search.query.as_deref().unwrap_or_default();
                 let max_results = search.max_results.unwrap_or(DEFAULT_SEARCH_RESULTS);
-                match index.search(query, search.server_ids.as_deref(), max_results) {
+                let selected = match &search.server_ids {
+                    Some(ids) => {
+                        if let Some(id) = ids.iter().find(|id| !allowed.contains(*id)) {
+                            return json!({"error": format!("unknown server `{id}`")});
+                        }
+                        ids.clone()
+                    }
+                    None => allowed.iter().cloned().collect(),
+                };
+                match index.search(query, Some(&selected), max_results) {
                     Ok(results) => json!(results),
                     Err(error) => json!({ "error": error }),
                 }
@@ -293,7 +321,7 @@ async fn serve() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Arc::new(Config::load(&args.config)?);
     let registry = Arc::new(Registry::start(
-        &config,
+        config.clone(),
         Duration::from_secs(args.call_timeout),
         args.retry_delays,
     ));
