@@ -63,7 +63,8 @@ impl AccessPolicies {
                 allowed: BTreeSet<String>,
             }
             let answer = result.and_then(|bytes| {
-                serde_json::from_slice::<Answer>(&bytes).map_err(|_| "invalid access response")
+                serde_json::from_slice::<Answer>(&bytes)
+                    .map_err(|_| crate::hooks::HookError::Failure("invalid access response"))
             });
             match answer {
                 Ok(answer) => answer.allowed.intersection(&requested).cloned().collect(),

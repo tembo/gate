@@ -85,7 +85,7 @@ impl Provider {
             request["rejectedCredentialId"] = id.into();
         }
         match self.hook.request(&binding.provider, &request, ct).await {
-            Err("credentials denied") => Outcome::Denied,
+            Err(crate::hooks::HookError::HttpStatus(401 | 403 | 404 | 410)) => Outcome::Denied,
             Err(_) => Outcome::Transient,
             Ok(bytes) => parse(&bytes).unwrap_or(Outcome::Transient),
         }

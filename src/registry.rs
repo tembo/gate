@@ -537,7 +537,7 @@ impl Supervisor {
     ) {
         let mut connected = self.connect_with_retries(first_attempt.take()).await;
         loop {
-            let (mut client, connection) = match connected.take() {
+            let (client, connection) = match connected.take() {
                 Some(connected) => connected,
                 None => {
                     let Some(result) = retries.recv().await else {
@@ -557,25 +557,38 @@ impl Supervisor {
                     }
                 }
             };
-            let change = self.maintain(&client, &connection, &mut events).await;
+            let stop = client.cancellation_token();
+            let mut closed: ClientClosed = Box::pin(client.waiting());
+            let change = self.maintain(&mut closed, &connection, &mut events).await;
             connection.stop();
             match change {
                 Change::Closed => {
                     self.status.send_replace(Status::Pending);
-                    let _ = client.close().await;
+                    self.next_lease = connection
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .lease
+                        .as_ref()
+                        .filter(|lease| {
+                            !lease.expired() && !self.rejected.contains(&lease.fingerprint)
+                        })
+                        .map(|lease| (**lease).clone());
                     sleep(RECONNECT_DELAY).await;
                     connected = self.connect_with_retries(None).await;
                 }
                 Change::Revoke(reason) => {
                     self.status.send_replace(Status::Failed(reason.into()));
                     connection.drain(self.drain_time()).await;
-                    let _ = client.close().await;
+                    stop.cancel();
+                    let _ = closed.await;
                 }
                 Change::Rotate(lease) => {
                     let (result, attempt) = Attempt::new();
                     self.status.send_replace(Status::Rotating(attempt));
                     connection.drain(self.drain_time()).await;
-                    let _ = client.close().await;
+                    stop.cancel();
+                    let _ = closed.await;
                     self.next_lease = lease.filter(|lease| !lease.expired());
                     match self.connect().await {
                         Ok((client, next)) => {
@@ -619,7 +632,7 @@ impl Supervisor {
 
     async fn maintain(
         &mut self,
-        client: &Client,
+        closed: &mut ClientClosed,
         connection: &Arc<Connection>,
         events: &mut mpsc::UnboundedReceiver<CredentialEvent>,
     ) -> Change {
@@ -635,17 +648,20 @@ impl Supervisor {
             // A failed HTTP exchange may close the transport too. Attribute its
             // rejection before treating closure as an ordinary reconnect.
             while let Ok(event) = events.try_recv() {
-                if let CredentialEvent::Rejected(rejected) = event
-                    && lease
-                        .as_ref()
-                        .is_some_and(|l| l.fingerprint == rejected.fingerprint)
-                {
-                    self.reject(lease.as_ref().expect("matched the current lease"));
-                    return Change::Rotate(None);
+                match event {
+                    CredentialEvent::Expired if lease.as_ref().is_some_and(|l| l.expired()) => {
+                        return Change::Revoke("its credentials expired");
+                    }
+                    CredentialEvent::Rejected(rejected)
+                        if lease
+                            .as_ref()
+                            .is_some_and(|l| l.fingerprint == rejected.fingerprint) =>
+                    {
+                        self.reject(lease.as_ref().expect("matched the current lease"));
+                        return Change::Rotate(None);
+                    }
+                    _ => {}
                 }
-            }
-            if client.is_transport_closed() {
-                return Change::Closed;
             }
             if refresh.is_none() && refresh_at.is_some_and(|t| chrono::Utc::now() >= t) {
                 let config = self.config.clone();
@@ -657,6 +673,7 @@ impl Supervisor {
                         .await
                 }));
             }
+            let next_refresh = if refresh.is_none() { refresh_at } else { None };
             tokio::select! {
                 biased;
                 event=events.recv() => match event {
@@ -669,6 +686,10 @@ impl Supervisor {
                 },
                 outcome=async { match &mut refresh { Some(f) => f.await, None => std::future::pending().await } } => {
                     refresh=None;
+                    let outcome = match outcome {
+                        Outcome::Lease(next) if next.expired() => Outcome::Transient,
+                        outcome => outcome,
+                    };
                     match outcome {
                         Outcome::Denied => return Change::Revoke("its credentials were denied"),
                         Outcome::Transient => {
@@ -678,7 +699,7 @@ impl Supervisor {
                             failures+=1;
                         }
                         Outcome::Lease(next) => {
-                            if next.expired() || self.rejected.contains(&next.fingerprint) { return Change::Revoke("the provider has no usable credential"); }
+                            if self.rejected.contains(&next.fingerprint) { return Change::Revoke("the provider has no usable credential"); }
                             if lease.as_ref().is_some_and(|l|l.fingerprint==next.fingerprint) {
                                 // Same material, new expiry and detectors. In-flight calls keep
                                 // the snapshot they captured when dispatched.
@@ -690,7 +711,19 @@ impl Supervisor {
                         }
                     }
                 },
-                ()=sleep(Duration::from_millis(50)) => {}
+                _ = &mut *closed => {
+                    // A rejection can arrive between polling events and observing
+                    // closure. Record it before deciding whether to reuse this lease.
+                    while let Ok(event) = events.try_recv() {
+                        if let CredentialEvent::Rejected(rejected) = event
+                            && lease.as_ref().is_some_and(|l| l.fingerprint == rejected.fingerprint) {
+                            self.reject(lease.as_ref().expect("matched the current lease"));
+                        }
+                    }
+                    return Change::Closed;
+                },
+                () = wait_until(lease.as_ref().and_then(|l| l.expires)) => {},
+                () = wait_until(next_refresh) => {},
             }
         }
     }
@@ -881,6 +914,16 @@ fn setup_auth(error: &anyhow::Error) -> bool {
             .is_some_and(initialize)
     })
 }
+type ClientClosed =
+    futures::future::BoxFuture<'static, Result<rmcp::service::QuitReason, tokio::task::JoinError>>;
+
+async fn wait_until(time: Option<chrono::DateTime<chrono::Utc>>) {
+    match time {
+        Some(time) => sleep((time - chrono::Utc::now()).to_std().unwrap_or_default()).await,
+        None => std::future::pending().await,
+    }
+}
+
 type Client = RunningService<RoleClient, ClientConfig>;
 
 async fn connect(
@@ -1054,7 +1097,7 @@ async fn forward_stderr(
             pending.extend_from_slice(&line);
             let safe = redactor.take(&mut pending, false);
             if !safe.is_empty() {
-                forward_line(&id, &safe, &mut tail);
+                forward_lines(&id, &safe, &mut tail);
             }
             line.clear();
         }
@@ -1062,9 +1105,15 @@ async fn forward_stderr(
     pending.extend_from_slice(&line);
     let safe = redactor.take(&mut pending, true);
     if !safe.is_empty() {
-        forward_line(&id, &safe, &mut tail);
+        forward_lines(&id, &safe, &mut tail);
     }
     tail
+}
+
+fn forward_lines(id: &str, bytes: &[u8], tail: &mut String) {
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        forward_line(id, line, tail);
+    }
 }
 
 fn forward_line(id: &str, line: &[u8], tail: &mut String) {

@@ -2648,3 +2648,52 @@ async fn leased_secrets_are_redacted_from_connection_errors_and_merged_keys_are_
         }
     }
 }
+
+#[tokio::test]
+async fn expired_refresh_is_transient_and_keeps_a_healthy_lease() {
+    let mut provider = serve_policy().await;
+    provider.credentials(credential_lease("one", json!({}), Some(400), Some(2000)));
+    let gateway =
+        credential_gateway(&provider, json!({"s":leased(nested_gate())}), "keep", 0).await;
+    gateway.wait_for_status("s", "ready").await;
+    provider.next_request().await;
+    provider.credentials(credential_lease(
+        "old",
+        json!({"v":"expired"}),
+        None,
+        Some(-1000),
+    ));
+    provider.next_request().await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(gateway.servers().await[0]["status"], "ready");
+    assert!(
+        !gateway
+            .call("call_mcp_tool", tool_call("list_mcp_servers"))
+            .await
+            .1
+    );
+    provider.credentials(credential_lease("one", json!({}), None, None));
+    while provider.requests.try_recv().is_ok() {}
+    provider.next_request().await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(gateway.servers().await[0]["status"], "ready");
+}
+
+#[tokio::test]
+async fn ordinary_reconnect_reuses_an_unexpired_lease() {
+    let mut provider = serve_policy().await;
+    provider.credentials(credential_lease("one", json!({}), None, None));
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let mut server = script("echo $$ > \"$PID_FILE\"; exec \"$GATE\" --config \"$EMPTY_CONFIG\"");
+    server["env"] = json!({"PID_FILE":pid_file});
+    let gateway = credential_gateway(&provider, json!({"s":leased(server)}), "keep", 0).await;
+    gateway.wait_for_status("s", "ready").await;
+    provider.next_request().await;
+    let old = std::fs::read_to_string(&pid_file).unwrap();
+    provider.credentials(json!({"outcome":"denied"}));
+    kill(&old);
+    wait_for_new_pid(&pid_file, &old).await;
+    gateway.wait_for_status("s", "ready").await;
+    assert!(provider.requests.try_recv().is_err());
+}

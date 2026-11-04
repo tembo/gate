@@ -65,7 +65,6 @@ impl HttpClient {
     pub fn new(auth: Arc<AuthResponses>) -> Result<Self, reqwest::Error> {
         Ok(Self {
             inner: reqwest::Client::builder()
-                .pool_max_idle_per_host(0)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             auth,
@@ -312,5 +311,50 @@ impl EventLimit {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn sequential_requests_reuse_the_http_connection() {
+        use axum::{extract::ConnectInfo, routing::post};
+        let (sent, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/",
+            post(
+                move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>| {
+                    let sent = sent.clone();
+                    async move {
+                        sent.send(peer).unwrap();
+                        http::StatusCode::ACCEPTED
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Arc<str> = format!("http://{}/", listener.local_addr().unwrap()).into();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        let client = HttpClient::new(Arc::new(AuthResponses::default())).unwrap();
+        for id in 0..2 {
+            let message = ClientJsonRpcMessage::request(
+                ClientRequest::PingRequest(Default::default()),
+                rmcp::model::RequestId::Number(id),
+            );
+            client
+                .post_message(uri.clone(), message, None, None, HashMap::new())
+                .await
+                .unwrap();
+        }
+        assert_eq!(peers.recv().await, peers.recv().await);
+        server.abort();
     }
 }

@@ -155,15 +155,34 @@ impl RawHook {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HookError {
+    HttpStatus(u16),
+    Failure(&'static str),
+}
+impl From<&'static str> for HookError {
+    fn from(message: &'static str) -> Self {
+        Self::Failure(message)
+    }
+}
+impl std::fmt::Display for HookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HttpStatus(_) => f.write_str("HTTP request was rejected"),
+            Self::Failure(message) => f.write_str(message),
+        }
+    }
+}
+
 impl Hook {
     pub async fn request(
         &self,
         name: &str,
         request: &Value,
         ct: &CancellationToken,
-    ) -> Result<Vec<u8>, &'static str> {
+    ) -> Result<Vec<u8>, HookError> {
         if ct.is_cancelled() {
-            return Err("cancelled");
+            return Err(HookError::Failure("cancelled"));
         }
         let operation = async {
             match &self.transport {
@@ -179,18 +198,15 @@ impl Hook {
                         .send()
                         .await
                         .map_err(|_| "HTTP request failed")?;
-                    if matches!(response.status().as_u16(), 401 | 403 | 404 | 410) {
-                        return Err("credentials denied");
-                    }
                     if !response.status().is_success() {
-                        return Err("HTTP request was rejected");
+                        return Err(HookError::HttpStatus(response.status().as_u16()));
                     }
                     let mut bytes = Vec::new();
                     while let Some(chunk) =
                         response.chunk().await.map_err(|_| "HTTP body failed")?
                     {
                         if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
-                            return Err("response exceeds 64 KiB");
+                            return Err(HookError::Failure("response exceeds 64 KiB"));
                         }
                         bytes.extend_from_slice(&chunk);
                     }
@@ -224,16 +240,18 @@ impl Hook {
                         serde_json::to_vec(request).map_err(|_| "could not encode request")?;
                     let exchange = async {
                         let write = async {
-                            stdin
-                                .write_all(&body)
-                                .await
-                                .map_err(|_| "could not write request")?;
-                            stdin
-                                .shutdown()
-                                .await
-                                .map_err(|_| "could not close stdin")?;
+                            if let Err(error) = stdin.write_all(&body).await
+                                && error.kind() != std::io::ErrorKind::BrokenPipe
+                            {
+                                return Err(HookError::Failure("could not write request"));
+                            }
+                            if let Err(error) = stdin.shutdown().await
+                                && error.kind() != std::io::ErrorKind::BrokenPipe
+                            {
+                                return Err(HookError::Failure("could not close stdin"));
+                            }
                             drop(stdin);
-                            Ok::<_, &'static str>(())
+                            Ok::<_, HookError>(())
                         };
                         let read = async {
                             let mut bytes = Vec::new();
@@ -243,7 +261,7 @@ impl Hook {
                                 .await
                                 .map_err(|_| "could not read response")?;
                             if bytes.len() > MAX_RESPONSE_BYTES {
-                                return Err("response exceeds 64 KiB");
+                                return Err(HookError::Failure("response exceeds 64 KiB"));
                             }
                             Ok(bytes)
                         };
@@ -264,20 +282,20 @@ impl Hook {
                                     );
                                 }
                             }
-                            Ok::<_, &'static str>(())
+                            Ok::<_, HookError>(())
                         };
                         let (_, bytes, ()) = tokio::try_join!(write, read, errors)?;
-                        Ok::<_, &'static str>(bytes)
+                        Ok::<_, HookError>(bytes)
                     };
                     let outcome = tokio::select! {
                         biased;
-                        () = ct.cancelled() => Err("cancelled"),
+                        () = ct.cancelled() => Err(HookError::Failure("cancelled")),
                         result = tokio::time::timeout(self.timeout, async {
                             let bytes = exchange.await?;
                             let status = child.wait().await.map_err(|_| "could not wait for command")?;
-                            if !status.success() { return Err("command failed"); }
+                            if !status.success() { return Err(HookError::Failure("command failed")); }
                             Ok(bytes)
-                        }) => result.unwrap_or(Err("timed out")),
+                        }) => result.unwrap_or(Err(HookError::Failure("timed out"))),
                     };
                     if outcome.is_err() {
                         let _ = child.start_kill();
@@ -293,8 +311,8 @@ impl Hook {
         } else {
             tokio::select! {
                 biased;
-                () = ct.cancelled() => Err("cancelled"),
-                result = tokio::time::timeout(self.timeout, operation) => result.unwrap_or(Err("timed out")),
+                () = ct.cancelled() => Err(HookError::Failure("cancelled")),
+                result = tokio::time::timeout(self.timeout, operation) => result.unwrap_or(Err(HookError::Failure("timed out"))),
             }
         }
     }
@@ -313,6 +331,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn helpers_may_ignore_large_requests_but_must_exit_successfully() {
+        for status in [0, 1] {
+            let script = format!("printf '{{\"allowed\":[]}}'; exit {status}");
+            let hook = hook(json!({"command":"/bin/sh", "args":["-c",script]}));
+            let result = hook
+                .request(
+                    "test",
+                    &json!({"request":"x".repeat(1024*1024)}),
+                    &CancellationToken::new(),
+                )
+                .await;
+            if status == 0 {
+                assert_eq!(result.unwrap(), br#"{"allowed":[]}"#);
+            } else {
+                assert_eq!(result.unwrap_err(), HookError::Failure("command failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn command_transport_bounds_output_and_requires_success() {
         for (script, expected) in [
             (
@@ -328,7 +366,8 @@ mod tests {
             assert_eq!(
                 hook.request("test", &json!({}), &CancellationToken::new())
                     .await
-                    .unwrap_err(),
+                    .unwrap_err()
+                    .to_string(),
                 expected
             );
         }
@@ -350,7 +389,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let pid = dir.path().join("pid");
             let hook = hook(
-                json!({"command":"/bin/sh", "args":["-c", "echo $$ > \"$1\"; exec /bin/sleep 30", "test", pid], "timeoutSeconds":1}),
+                json!({"command":"/bin/sh", "args":["-c", "echo $$ > \"$1\"; exec sleep 30", "test", pid], "timeoutSeconds":1}),
             );
             let ct = CancellationToken::new();
             let request = hook.request("test", &Value::Null, &ct);
@@ -368,7 +407,7 @@ mod tests {
             };
             let (outcome, ()) = tokio::join!(request, stop);
             assert_eq!(
-                outcome.unwrap_err(),
+                outcome.unwrap_err().to_string(),
                 if cancel { "cancelled" } else { "timed out" }
             );
             let pid = std::fs::read_to_string(pid).unwrap();
@@ -415,7 +454,7 @@ mod tests {
             };
             let (outcome, ()) = tokio::join!(request, stop);
             assert_eq!(
-                outcome.unwrap_err(),
+                outcome.unwrap_err().to_string(),
                 if cancel { "cancelled" } else { "timed out" }
             );
         }

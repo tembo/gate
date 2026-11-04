@@ -20,15 +20,20 @@ impl Redactor {
         String::from_utf8_lossy(&self.take(&mut buffer, true)).into_owned()
     }
     pub fn take(&self, buffer: &mut Vec<u8>, eof: bool) -> Vec<u8> {
-        let hold = if eof {
-            0
-        } else {
-            self.secrets.first().map_or(0, |s| s.len() - 1)
-        };
-        let limit = buffer.len().saturating_sub(hold);
         let mut out = Vec::new();
         let mut cursor = 0;
-        while cursor < limit {
+        while cursor < buffer.len() {
+            let rest = &buffer[cursor..];
+            // Wait only if the remaining bytes could become a longer secret.
+            // This also preserves longest-match behavior for overlapping values.
+            if !eof
+                && self
+                    .secrets
+                    .iter()
+                    .any(|s| rest.len() < s.len() && s.starts_with(rest))
+            {
+                break;
+            }
             if let Some(secret) = self
                 .secrets
                 .iter()
@@ -49,6 +54,20 @@ impl Redactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwards_unrelated_lines_and_holds_only_possible_secret_prefixes() {
+        let redactor = Redactor::new(&BTreeMap::from([(
+            "token".into(),
+            "secret-token-value".into(),
+        )]));
+        let mut pending = b"ready\nnext line\nsec".to_vec();
+        assert_eq!(redactor.take(&mut pending, false), b"ready\nnext line\n");
+        assert_eq!(pending, b"sec");
+        pending.extend_from_slice(b"ret-token-value\ndone\n");
+        assert_eq!(redactor.take(&mut pending, false), b"<redacted>\ndone\n");
+        assert!(pending.is_empty());
+    }
+
     #[test]
     fn redacts_every_split_and_overlapping_prefixes() {
         let redactor = Redactor::new(&BTreeMap::from([

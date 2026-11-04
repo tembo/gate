@@ -463,9 +463,15 @@ mod tests {
 
     /// A runner whose workers run this shell script, with an empty environment
     fn fake_worker(script: String, timeout: Duration) -> CodeRunner {
+        // Resolve through the test runner's PATH before the worker's environment
+        // is cleared. NixOS does not provide /bin/sleep (or a usable default PATH).
+        let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("sleep"))
+            .find(|path| path.is_file())
+            .expect("sleep must be available on the test runner's PATH");
         let worker = Arc::new(move || {
             let mut command = Command::new("/bin/sh");
-            command.args(["-c", &script]);
+            command.args(["-c", &script, "gate-test"]).arg(&sleep);
             command
         });
         let config = crate::config::Config {
@@ -611,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn keeps_its_deadline_when_the_worker_stops_reading() {
         // The script is far bigger than a pipe's buffer, so writing it blocks forever
-        let runner = fake_worker("exec /bin/sleep 30".into(), Duration::from_secs(1));
+        let runner = fake_worker(r#"exec "$1" 30"#.into(), Duration::from_secs(1));
         let started = Instant::now();
         let error = run(&runner, &"x".repeat(1024 * 1024)).await.unwrap_err();
         assert_eq!(error, timed_out(Duration::from_secs(1)));
@@ -626,7 +632,7 @@ mod tests {
     fn waiting_worker() -> (CodeRunner, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
-        let script = format!("echo $$ > '{}'; exec /bin/sleep 30", pid_file.display());
+        let script = format!(r#"echo $$ > '{}'; exec "$1" 30"#, pid_file.display());
         (fake_worker(script, Duration::from_secs(30)), dir, pid_file)
     }
 
