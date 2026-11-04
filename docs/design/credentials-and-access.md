@@ -1,6 +1,6 @@
 # Design: credential providers and access policies
 
-Status: draft, revision 2
+Status: draft, revision 3
 
 ## Summary
 
@@ -180,33 +180,45 @@ A provider answers with one of three outcomes.
 |---|---|---|
 | `credentialId` | yes | Identifies the credential material, not this issuance. A provider that returns the same token again must return the same ID. gate reports it back as `rejectedCredentialId`. |
 | `values` | yes | Fills the server's `${credential:NAME}` placeholders, or its environment (see [Leased environments](#leased-environments)) |
-| `refreshAfter` | no | When gate should ask again. Without it, gate keeps the lease until it's rejected, denied or expires. |
-| `expiresAt` | no | When the lease must stop being used. Must not be before `refreshAfter`. |
+| `refreshAfter` | no | When gate should ask again |
+| `expiresAt` | no | The lease's hard expiry: no call is sent with it from this time on |
 | `authFailures` | no | Extra ways to recognize a rejected credential in tool results, for this lease only |
 
 **`denied`**: the caller may no longer use this server's credentials, for example because the
 platform deactivated the session or the connection was removed. gate stops using any lease it
 has for the server.
 
-**`transient`**: the provider can't answer right now. gate keeps an unexpired lease and tries
-again later.
+**`transient`**: the provider can't answer right now. gate tries again later, and whether it
+keeps using an unexpired lease meanwhile depends on the provider's `refreshFailure` setting
+(see [Refreshing](#refreshing)).
 
 ```json
 { "outcome": "denied" }
 ```
 
-When a hook doesn't answer with an outcome, gate classifies the failure:
+gate decides the outcome by applying these rules in order, stopping at the first that applies.
 
-| Failure | Outcome |
-|---|---|
-| HTTP `4xx` without a valid body | `denied` |
-| HTTP `5xx`, timeout, connection error | `transient` |
-| Command exits nonzero, or times out | `transient` |
-| A body that isn't valid JSON or doesn't match the schema | `transient` |
+For `http` hooks:
 
-So an existing endpoint that uses `403` and `404` for revoked access works without changes.
-gate never treats a malformed answer as a revocation, and never treats a revocation as a
-reason to retry.
+1. No response, because of a connection error or the timeout: `transient`.
+2. Status `401`, `403`, `404` or `410`: `denied`, whatever the body says.
+3. Any other status outside `2xx`, including `408`, `429` and `5xx`: `transient`, whatever the
+   body says.
+4. Status `2xx` with a valid answer: that answer's outcome.
+5. Status `2xx` with anything else: `transient`.
+
+For `command` hooks:
+
+1. The command timed out or couldn't be started: `transient`.
+2. It exited nonzero: `transient`. Its stdout is ignored, even if it holds a valid answer, since
+   a crashing helper may have written only part of one. A helper that means to deny must exit
+   with status 0.
+3. It exited with status 0 and wrote a valid answer: that answer's outcome.
+4. It exited with status 0 and wrote anything else: `transient`.
+
+So an existing endpoint that uses `403` and `404` for revoked access works without changes,
+and a rate-limited or overloaded provider never closes healthy connections. gate never treats
+a malformed answer as a revocation, and never treats a revocation as a reason to retry.
 
 ### Fingerprints
 
@@ -259,36 +271,64 @@ wait for its result.
 
 Getting a lease is the first step of a connection attempt:
 
-1. Ask the provider for a lease.
-   - `lease`: if its fingerprint has been rejected, the attempt fails with "the provider has
-     no other credential". Otherwise, continue.
+1. Ask the provider for a lease. If an earlier attempt's credential was rejected and the
+   provider hasn't returned different values since, the request carries that credential's ID
+   as `rejectedCredentialId`.
+   - `lease`: if its fingerprint has been rejected for this server, the attempt fails with "the
+     provider has no other credential". If it has already expired, the attempt fails.
+     Otherwise, continue.
    - `transient`: the attempt fails, and the usual retry delays apply.
    - `denied`: the attempt fails, and the server skips any remaining background attempts.
      The next request that needs the server triggers one new attempt, as for any failed
      server.
-2. Expand the server's placeholders with the lease, and merge it into the environment if
+2. Record the lease's ID and fingerprint for this attempt.
+3. Expand the server's placeholders with the lease, and merge it into the environment if
    `mergeEnv` is set.
-3. Start the server or open the HTTP session, then list its tools, as today.
+4. Start the server or open the HTTP session, then list its tools, as today.
+5. If the lease's `expiresAt` has passed by the time the server is ready, close the new
+   connection. The attempt fails, and the next one asks for a new lease.
+
+A credential can also be rejected during setup, while initializing or listing tools. If step 4
+fails with an auth failure (see [Auth failures](#auth-failures)), the fingerprint recorded in
+step 2 is marked rejected, and the next attempt asks for a lease with that credential's ID as
+`rejectedCredentialId`. The usual retry delays apply, so a provider that keeps returning the
+same credential can't cause a tight loop.
 
 ### Refreshing
 
-At `refreshAfter`, the supervisor of a `Ready(g)` server asks for a new lease:
+Two separate settings govern how long a lease is used:
+
+- **Hard expiry.** `expiresAt` is absolute. No call is sent with a lease from that time on,
+  whatever else happens.
+- **What a failed refresh does.** The provider's `refreshFailure` setting decides whether a
+  `transient` refresh failure lets gate keep using an unexpired lease:
+
+  ```json
+  "credentialProviders": { "platform": { "http": { "...": "..." }, "refreshFailure": "keep" } }
+  ```
+
+The supervisor of a `Ready(g)` server asks for a new lease at `refreshAfter`. If `refreshAfter`
+is missing, or isn't before `expiresAt`, it asks shortly before `expiresAt` instead: a tenth of
+the lease's lifetime early, but never more than a minute. A lease with neither time is kept
+until it's rejected or denied.
 
 | Outcome | What happens |
 |---|---|
 | `lease`, same fingerprint | Replace `L(g)`'s ID, times and matchers, and keep connection `g` |
 | `lease`, new fingerprint | Rotate to the new lease |
-| `transient` | Keep `L(g)` until its `expiresAt`, asking again with the usual retry delays |
+| `transient`, with `refreshFailure: "keep"` (the default) | Keep `L(g)` until its `expiresAt`, asking again with the usual retry delays |
+| `transient`, with `refreshFailure: "revoke"` | [Revoke](#revoking) |
 | `denied` | [Revoke](#revoking) |
 
 At `expiresAt`, if `L(g)` hasn't been replaced, the server revokes it. gate also checks
 `expiresAt` before every call, so a supervisor that wakes up late, for example after the
 machine was suspended, can't use an expired lease.
 
-Keeping a lease through a `transient` failure is a deliberate choice. It rides out short
-outages, and the provider bounds it with `expiresAt`. A provider that wants every failed
-refresh to stop the server, like the TypeScript gateway does, sets `expiresAt` equal to
-`refreshAfter`.
+Keeping a lease through a `transient` failure rides out short provider outages, with
+`expiresAt` as the bound. The TypeScript gateway instead stops a server whenever a refresh
+fails. A provider that wants that sets `refreshFailure: "revoke"`. Setting `expiresAt` equal to
+`refreshAfter` wouldn't do the same thing, since then the lease would expire while a healthy
+refresh was still under way.
 
 ### Rotating
 
@@ -302,8 +342,10 @@ Rotating replaces connection `g` with connection `g + 1`:
 3. Connection `g` is closed. Stdio servers are restarted, since their environment can't
    change.
 4. Connection `g + 1` is made with the new lease, or with one the provider gives now if
-   rotation started from a rejection. If that fails, the server follows the usual rules for
-   failed attempts.
+   rotation started from a rejection. A lease obtained before the drain is checked again
+   first: if it expired during the drain, gate asks for another. Connecting follows the steps
+   in [Connecting](#connecting), and if it fails, the server follows the usual rules for failed
+   attempts.
 5. Requests that waited check access again before they're sent (see
    [Where gate applies it](#where-gate-applies-it)).
 
@@ -321,15 +363,31 @@ When a lease is denied or expires:
 
 ### Auth failures
 
-A call can show that its credential was rejected. gate looks for this in three built-in ways:
+A credential can be rejected during setup or during a call. gate looks for this in three
+built-in ways:
 
-1. **HTTP status.** The downstream server answered 401. rmcp reports a 401 as
-   `StreamableHttpError::AuthRequired` only if the response has a `WWW-Authenticate` header.
-   Otherwise it's a generic HTTP status error. gate reads the status from the error's source
-   chain before formatting anything, so it catches both, and is tested with and without the
-   header.
+1. **HTTP status.** The downstream server answered a request with HTTP 401, whatever the body
+   held.
 2. **JSON-RPC error.** The error's `data.status` is 401.
 3. **Tool result.** The result has `isError: true` and its `structuredContent.status` is 401.
+
+The HTTP status has to be captured where the response arrives. rmcp 3.5.1 reports a 401 as
+`StreamableHttpError::AuthRequired` only if the response has a `WWW-Authenticate` header.
+Otherwise, it either turns the body into a JSON-RPC error, dropping the status, or reports
+`UnexpectedServerResponse` with the status only as formatted text. Neither keeps the status in
+a form gate can rely on, and gate never parses formatted errors. Instead, gate records each
+response's status at the transport boundary:
+
+- either gate implements rmcp's public `StreamableHttpClient` trait itself, wrapping `reqwest`,
+  and associates each response's status with the JSON-RPC request it answers
+- or rmcp is changed upstream to keep the status on these errors, and gate uses that
+
+With either approach, a JSON-RPC error that arrived on an HTTP 401 response counts as an auth
+failure even without `data.status`. The tests cover a 401 with `WWW-Authenticate`, one without
+it and with a plain body, and one without it and with a JSON-RPC error lacking `data.status`.
+Each is checked during initialization, during tool listing and during a call.
+
+Stdio servers have no HTTP status, so during setup they're detected only by the JSON-RPC rule.
 
 Each lease can add more ways in `authFailures`. A matcher matches when every field it has
 matches:
@@ -348,7 +406,8 @@ config, because the provider knows which server and version a credential is for.
 ### Attributing failures
 
 Calls can still be running when a lease changes, so a failure must be attributed to the
-credential that call used, not to whichever one is current:
+credential that call used, not to whichever one is current. Setup failures are attributed to
+the lease their attempt recorded (see [Connecting](#connecting)). For calls:
 
 1. Every call records, when it's sent, its connection `g`, the fingerprint of `L(g)`, and
    `L(g)`'s matchers.
@@ -359,7 +418,9 @@ credential that call used, not to whichever one is current:
 4. The first failure that counts marks the fingerprint as rejected, and the server rotates,
    asking for a lease with `rejectedCredentialId` set to `L(g)`'s ID. Any further failures for
    the same fingerprint join that recovery.
-5. gate remembers the last 16 rejected fingerprints for as long as it runs.
+5. Each server remembers its last 16 rejected fingerprints for as long as gate runs. They're
+   kept per server: a credential that one server rejected may still be valid for another, even
+   from the same provider.
 
 The call that saw the failure returns exactly what the server sent, or fails with the
 transport's error. **Calls are never replayed**, whatever happens, since they may already
@@ -398,10 +459,14 @@ The caller can change between requests without gate knowing, for example when a 
 decides who the caller is from state on its side. Reusing a yes could give one caller
 another's access.
 
-Within one request, gate asks each policy exactly once, with every relevant server in a
+To decide what a request may use, gate asks each policy once, with every relevant server in a
 single call, and uses that answer for the whole request. A batch of 20 searches makes one
 call per policy, not 20, and is never split. A policy that can't handle that many servers
 should fail, which hides them all.
+
+The only other calls are re-checks just before a tool call is sent. They happen when the call
+had to wait for a connection, and for every call a script makes (see below). Each re-check
+asks about that one server, and its answer is used only for that call.
 
 Caching across requests is deferred (see [Deferred](#deferred)).
 
@@ -561,7 +626,8 @@ program that embeds gate has to choose:
 | Allow `${credential:…}` in `args`? | No. Wrap servers that need it in a script that reads the variable. |
 | Tell `list_mcp_servers` how many servers are hidden? | No. It says something about the policy. |
 | Policies that answer "read-only" and similar? | Deferred. The response format leaves room for it. |
-| Keep an unexpired lease when a refresh fails transiently? | Yes. Providers that don't want this set `expiresAt` equal to `refreshAfter`. |
+| Keep an unexpired lease when a refresh fails transiently? | By default, yes. Providers that don't want this set `refreshFailure: "revoke"`. |
+| Does a nonzero exit override a valid answer from a command hook? | Yes. It's always `transient`. |
 | Support HTTP+SSE servers? | No. rmcp has no client for this deprecated transport. |
 
 ## Deferred
@@ -590,25 +656,42 @@ Each step can be released on its own:
 2. **Hook transports and access policies.** The smaller hook, which gets the shared transport
    code into use.
 3. **Credential providers.** Outcomes, fingerprints, the server states above, attributing
-   failures, built-in and lease detectors, `mergeEnv` and redaction.
+   failures, capturing HTTP status at the transport boundary, built-in and lease detectors,
+   `mergeEnv` and redaction.
 4. **Public Rust API.** Document and stabilize the traits once both hooks have settled.
 
 Tests use the same approach as today's integration tests: hook servers built with axum,
 command hooks written as shell scripts, and echo MCP servers. They should cover at least:
 
 - each outcome, from each transport, while connecting, refreshing and rotating
-- `4xx` without a body revokes, while `5xx`, timeouts and malformed answers don't
+- the classification rules, in order:
+  - `401`, `403`, `404` and `410` deny, whatever the body
+  - `408`, `429`, `5xx` and timeouts are transient, whatever the body
+  - a malformed `2xx` answer is transient
+  - a nonzero exit is transient, even after a valid answer on stdout
+- `refreshFailure: "keep"` rides out a transient failure until `expiresAt`, and `"revoke"` stops
+  the server at once
+- a healthy refresh never interrupts calls, even shortly before `expiresAt`
+- a replacement lease that expires during the drain, or before its connection is ready, is
+  replaced
+- a credential rejected during initialization or tool listing is reported as
+  `rejectedCredentialId` on the next lease request, and the same values aren't used again
 - requests that arrive during a rotation wait for the new connection, then check access again
 - running calls finish within `drainSeconds`, or are cancelled and reported as interrupted
 - a late failure from an old credential doesn't invalidate the new one
 - several failures for the same credential cause one rotation
 - a lease with rejected values is refused, even under a new `credentialId`
 - a refreshed lease's matchers replace the old ones
-- 401s are detected with and without `WWW-Authenticate`, from JSON-RPC errors and from
-  structured results
+- a credential rejected by one server isn't refused for another
+- 401s are detected:
+  - with `WWW-Authenticate`
+  - without it, with a plain body
+  - without it, with a JSON-RPC error lacking `data.status`
+  - each during initialization, tool listing and calls
+  - from JSON-RPC errors with `data.status`, and from structured results
 - secrets are redacted from stderr, including across chunks and during a rotation
-- the policy is asked once per request, never answers from an earlier request, and hides only
-  its own servers when it fails
+- the policy is asked once per request plus the specified re-checks, never answers from an
+  earlier request, and hides only its own servers when it fails
 - scripts can't call servers outside their ceiling, and lose servers the policy stops allowing
 - `hookEnv` variables never reach servers, and naming one in a server's config is an error
 
@@ -640,6 +723,7 @@ be a deliberate change in behavior:
 | Hook endpoints | Adapt the existing credential and access endpoints, or put adapters in front of them. Their request and response formats differ from the ones here. |
 | Config and launch | Generate gate's config instead of the current manifest, and launch gate instead of the current gateway command |
 | Credential formats | Turn each existing auth-error format into lease `authFailures`, and use `mergeEnv` for stdio servers whose leased variables vary |
+| Refresh failures | Choose `refreshFailure`. `"revoke"` matches today's gateway, while `"keep"` would be a deliberate change. |
 | Code mode | gate runs JavaScript and returns `logs`, while the current gateway runs TypeScript and returns `stdout` and `stderr`. Either gate strips TypeScript types, or the tool's contract and agent prompts change. |
 | SSE servers | Move any remaining SSE servers to Streamable HTTP |
 | Gateway identity | Configure the server name, instructions and tool descriptions agents see today |
@@ -650,6 +734,8 @@ check that they agree, except where a difference was chosen on purpose:
 - the active message changes between requests, and during a script
 - a sandbox or connection is revoked while servers are connected and calls are running
 - credentials are refreshed and rotated with calls running
+- a credential is rejected while connecting, and again while calls are running
+- the provider is throttled or unavailable during a refresh
 - every existing auth-error format, with both matching and nearly matching fixtures
 - what personal servers each caller sees, in every tool
 - which variables each server gets
