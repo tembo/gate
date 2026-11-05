@@ -15,9 +15,32 @@ pub type ServerId = String;
 
 #[derive(Debug)]
 pub struct Config {
+    pub gateway: GatewaySettings,
     pub servers: BTreeMap<ServerId, Server>,
     pub credential_providers: BTreeMap<String, crate::credentials::Provider>,
     pub access_policies: BTreeMap<String, crate::hooks::Hook>,
+}
+
+/// Agent-facing metadata; these strings are literal and never expand secrets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewaySettings {
+    pub name: String,
+    pub version: String,
+    pub title: Option<String>,
+    pub instructions: Option<String>,
+    pub tool_descriptions: BTreeMap<String, String>,
+}
+impl Default for GatewaySettings {
+    fn default() -> Self {
+        Self {
+            name: "gate".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            title: None,
+            instructions: None,
+            tool_descriptions: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -125,6 +148,8 @@ impl fmt::Display for Kind {
 #[serde(rename_all = "camelCase")]
 struct RawConfig {
     #[serde(default)]
+    gateway: GatewaySettings,
+    #[serde(default)]
     access_policies: BTreeMap<String, crate::hooks::RawHook>,
     #[serde(default)]
     credential_providers: BTreeMap<String, crate::credentials::RawProvider>,
@@ -198,6 +223,14 @@ impl Config {
     /// Parses a config, resolving placeholders through the `env` closure
     fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let raw: RawConfig = serde_json::from_str(text)?;
+        if raw.gateway.name.trim().is_empty() || raw.gateway.version.trim().is_empty() {
+            bail!("gateway name and version must not be empty");
+        }
+        for name in raw.gateway.tool_descriptions.keys() {
+            if crate::Gate::tool_router().get(name).is_none() {
+                bail!("unknown gateway tool `{name}`");
+            }
+        }
         validate_environment_names(&raw.hook_env)?;
         validate_inheritance(&raw.inherit_env)?;
         let raw_inheritance = raw.inherit_env;
@@ -254,6 +287,7 @@ impl Config {
             .collect::<Result<_>>()?;
 
         Ok(Self {
+            gateway: raw.gateway,
             servers,
             access_policies,
             credential_providers,
@@ -444,6 +478,19 @@ mod tests {
 
     fn error(server: serde_json::Value) -> String {
         format!("{:#}", parse_one(server).unwrap_err())
+    }
+
+    #[test]
+    fn validates_gateway_metadata() {
+        for gateway in [
+            serde_json::json!({"name":" "}),
+            serde_json::json!({"version":""}),
+            serde_json::json!({"toolDescriptions":{"missing":"description"}}),
+            serde_json::json!({"instruction":"typo"}),
+        ] {
+            let config = serde_json::json!({"gateway":gateway,"mcpServers":{}});
+            assert!(parse(&config.to_string()).is_err(), "{config}");
+        }
     }
 
     #[test]
