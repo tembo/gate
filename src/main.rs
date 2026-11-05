@@ -309,6 +309,7 @@ impl ServerHandler for Gate {
         let settings = &self.config.gateway;
         let mut identity = rmcp::model::Implementation::new(&settings.name, &settings.version);
         identity.title = settings.title.clone();
+        identity.description = settings.description.clone();
         let mut info = rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()

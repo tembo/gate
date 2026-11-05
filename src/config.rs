@@ -28,6 +28,7 @@ pub struct GatewaySettings {
     pub name: String,
     pub version: String,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub instructions: Option<String>,
     pub tool_descriptions: BTreeMap<String, String>,
 }
@@ -37,6 +38,7 @@ impl Default for GatewaySettings {
             name: "gate".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             title: None,
+            description: None,
             instructions: None,
             tool_descriptions: BTreeMap::new(),
         }

@@ -2701,7 +2701,7 @@ async fn ordinary_reconnect_reuses_an_unexpired_lease() {
 #[tokio::test]
 async fn advertises_configured_gateway_metadata() {
     let gateway=Gateway::spawn_config(json!({
-        "gateway":{"name":"tembo-mcp-gateway","version":"test","title":"Tembo tools","instructions":"Use the search tool first. ${TOKEN}","toolDescriptions":{"execute_mcp_code":"Run a Tembo script"}},
+        "gateway":{"name":"tembo-mcp-gateway","version":"test","title":"Tembo tools","description":"Tembo gateway ${TOKEN}","instructions":"Use the search tool first. ${TOKEN}","toolDescriptions":{"execute_mcp_code":"Run a Tembo script"}},
         "mcpServers":{}
     }), &[], &[], Stdio::inherit()).await.0;
     let info = gateway.client.peer_info().unwrap();
@@ -2710,6 +2710,10 @@ async fn advertises_configured_gateway_metadata() {
     assert_eq!(
         info.server_info.as_ref().unwrap().title.as_deref(),
         Some("Tembo tools")
+    );
+    assert_eq!(
+        info.server_info.as_ref().unwrap().description.as_deref(),
+        Some("Tembo gateway ${TOKEN}")
     );
     assert_eq!(
         info.instructions.as_deref(),
