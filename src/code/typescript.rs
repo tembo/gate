@@ -1,6 +1,7 @@
 //! Single-snippet TypeScript transformation. No module resolution or type checking.
 use oxc::{
     allocator::Allocator,
+    ast::AstKind,
     codegen::Codegen,
     diagnostics::OxcDiagnostic,
     parser::Parser,
@@ -25,6 +26,14 @@ pub fn compile(code: &str) -> Result<String, String> {
         .build(&program);
     if let Some(error) = semantic.errors.first() {
         return Err(diagnostic(error, &source, code.len()));
+    }
+    if semantic
+        .semantic
+        .nodes()
+        .iter()
+        .any(|node| matches!(node.kind(), AstKind::Decorator(_)))
+    {
+        return Err("unsupported script syntax: decorators are not supported".into());
     }
     if semantic
         .semantic
@@ -85,6 +94,22 @@ mod tests {
     fn rejects_module_and_jsx_syntax() {
         for source in ["import x from 'package'; return x;", "return <div />;"] {
             assert!(compile(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_decorators_before_execution() {
+        for source in [
+            "@decorate class Example {}",
+            "class Example { @decorate method() {} }",
+            "class Example { @decorate field = 1; }",
+            "return class { @decorate method() {} };",
+        ] {
+            assert_eq!(
+                compile(source).unwrap_err(),
+                "unsupported script syntax: decorators are not supported",
+                "{source}"
+            );
         }
     }
 }
