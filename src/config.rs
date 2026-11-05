@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     env, fmt, fs,
     path::Path,
 };
@@ -16,12 +16,23 @@ pub type ServerId = String;
 #[derive(Debug)]
 pub struct Config {
     pub servers: BTreeMap<ServerId, Server>,
+    pub credential_providers: BTreeMap<String, crate::credentials::Provider>,
+    pub access_policies: BTreeMap<String, crate::hooks::Hook>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Server {
     pub description: Option<String>,
+    pub access: Option<Access>,
+    pub credentials: Option<crate::credentials::Binding>,
     pub transport: Transport,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Access {
+    pub policy: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,11 +41,58 @@ pub enum Transport {
         command: String,
         args: Vec<String>,
         env: BTreeMap<String, String>,
+        environment: Environment,
     },
     Http {
         url: String,
         headers: BTreeMap<String, String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum InheritEnv {
+    All(bool),
+    Names(BTreeSet<String>),
+}
+
+impl Default for InheritEnv {
+    fn default() -> Self {
+        Self::All(true)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Environment {
+    inherit: InheritEnv,
+    pub(crate) hook_env: BTreeSet<String>,
+}
+
+impl Environment {
+    pub fn apply(
+        &self,
+        command: &mut tokio::process::Command,
+        explicit: &BTreeMap<String, String>,
+    ) {
+        command.env_clear();
+        command.envs(env::vars_os().filter(|(name, _)| {
+            if name
+                .to_str()
+                .is_some_and(|name| self.hook_env.contains(name))
+            {
+                return false;
+            }
+            match &self.inherit {
+                InheritEnv::All(inherit) => *inherit,
+                InheritEnv::Names(names) => name.to_str().is_some_and(|name| names.contains(name)),
+            }
+        }));
+        command.envs(
+            explicit
+                .iter()
+                .filter(|(name, _)| !self.hook_env.contains(*name)),
+        );
+    }
 }
 
 impl Transport {
@@ -66,6 +124,14 @@ impl fmt::Display for Kind {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawConfig {
+    #[serde(default)]
+    access_policies: BTreeMap<String, crate::hooks::RawHook>,
+    #[serde(default)]
+    credential_providers: BTreeMap<String, crate::credentials::RawProvider>,
+    #[serde(default)]
+    hook_env: BTreeSet<String>,
+    #[serde(default)]
+    inherit_env: InheritEnv,
     #[serde(deserialize_with = "unique_servers")]
     mcp_servers: BTreeMap<String, RawServer>,
 }
@@ -107,6 +173,10 @@ fn unique_servers<'de, D: Deserializer<'de>>(
 
 #[derive(Deserialize)]
 struct RawServer {
+    credentials: Option<crate::credentials::Binding>,
+    access: Option<Access>,
+    #[serde(rename = "inheritEnv")]
+    inherit_env: Option<InheritEnv>,
     #[serde(rename = "type")]
     kind: Option<Kind>,
     command: Option<String>,
@@ -128,6 +198,32 @@ impl Config {
     /// Parses a config, resolving placeholders through the `env` closure
     fn parse(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let raw: RawConfig = serde_json::from_str(text)?;
+        validate_environment_names(&raw.hook_env)?;
+        validate_inheritance(&raw.inherit_env)?;
+        let raw_inheritance = raw.inherit_env;
+        let mut hook_env = raw.hook_env;
+        let mut access_policies = BTreeMap::new();
+        for (name, hook) in raw.access_policies {
+            if name.is_empty() {
+                bail!("policy names must not be empty");
+            }
+            let hook = hook
+                .resolve(&env, &mut hook_env)
+                .with_context(|| format!("invalid access policy `{name}`"))?;
+            access_policies.insert(name, hook);
+        }
+        let mut credential_providers = BTreeMap::new();
+        for (name, provider) in raw.credential_providers {
+            if name.is_empty() {
+                bail!("provider names must not be empty");
+            }
+            credential_providers.insert(
+                name.clone(),
+                provider
+                    .resolve(&env, &mut hook_env)
+                    .with_context(|| format!("invalid credential provider `{name}`"))?,
+            );
+        }
         let servers = raw
             .mcp_servers
             .into_iter()
@@ -135,18 +231,46 @@ impl Config {
                 if name.is_empty() {
                     bail!("server names must not be empty");
                 }
-                let server = Server::from_raw(raw, &env)
+                if let Some(access) = &raw.access
+                    && !access_policies.contains_key(&access.policy)
+                {
+                    bail!(
+                        "server `{name}` references unknown access policy `{}`",
+                        access.policy
+                    );
+                }
+                if let Some(credentials) = &raw.credentials
+                    && !credential_providers.contains_key(&credentials.provider)
+                {
+                    bail!(
+                        "server `{name}` references unknown credential provider `{}`",
+                        credentials.provider
+                    );
+                }
+                let server = Server::from_raw(raw, &env, &raw_inheritance, &hook_env)
                     .with_context(|| format!("invalid server `{name}`"))?;
                 Ok((name, server))
             })
             .collect::<Result<_>>()?;
 
-        Ok(Self { servers })
+        Ok(Self {
+            servers,
+            access_policies,
+            credential_providers,
+        })
     }
 }
 
 impl Server {
-    fn from_raw(raw: RawServer, env: &impl Fn(&str) -> Option<String>) -> Result<Self> {
+    fn from_raw(
+        raw: RawServer,
+        env: &impl Fn(&str) -> Option<String>,
+        inherited: &InheritEnv,
+        hook_env: &BTreeSet<String>,
+    ) -> Result<Self> {
+        if let Some(inherit) = &raw.inherit_env {
+            validate_inheritance(inherit)?;
+        }
         let kind = match (raw.kind, &raw.command, &raw.url) {
             (Some(kind), _, _) => kind,
             (None, Some(_), None) => Kind::Stdio,
@@ -156,7 +280,13 @@ impl Server {
         };
 
         let expand = |field: &str, text: &str| {
-            expand(text, env).with_context(|| format!("failed to expand `{field}`"))
+            if text.contains("${credential:")
+                && !field.starts_with("env.")
+                && !field.starts_with("headers.")
+            {
+                bail!("credential placeholders are only allowed in env and headers");
+            }
+            expand(text, env, hook_env).with_context(|| format!("failed to expand `{field}`"))
         };
         let expand_map = |field: &str, map: Option<BTreeMap<String, String>>| {
             map.unwrap_or_default()
@@ -180,9 +310,24 @@ impl Server {
                     .map(|arg| expand("args", arg))
                     .collect::<Result<_>>()?;
                 let env = expand_map("env", raw.env)?;
-                Transport::Stdio { command, args, env }
+                for name in env.keys() {
+                    if hook_env.contains(name) {
+                        bail!("environment variable `{name}` is reserved for hooks");
+                    }
+                }
+                let environment = Environment {
+                    inherit: raw.inherit_env.unwrap_or_else(|| inherited.clone()),
+                    hook_env: hook_env.clone(),
+                };
+                Transport::Stdio {
+                    command,
+                    args,
+                    env,
+                    environment,
+                }
             }
             Kind::Http => {
+                reject(kind, "inheritEnv", &raw.inherit_env)?;
                 reject(kind, "command", &raw.command)?;
                 reject(kind, "args", &raw.args)?;
                 reject(kind, "env", &raw.env)?;
@@ -197,8 +342,11 @@ impl Server {
             }
         };
 
+        crate::credentials::validate_transport(&transport, raw.credentials.as_ref())?;
         Ok(Self {
+            credentials: raw.credentials,
             description: raw.description,
+            access: raw.access,
             transport,
         })
     }
@@ -211,7 +359,27 @@ fn reject<T>(kind: Kind, field: &str, value: &Option<T>) -> Result<()> {
     Ok(())
 }
 
-fn expand(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<String> {
+fn validate_environment_names(names: &BTreeSet<String>) -> Result<()> {
+    for name in names {
+        if !is_var_name(name) {
+            bail!("invalid environment variable name `{name}`");
+        }
+    }
+    Ok(())
+}
+
+fn validate_inheritance(inherit: &InheritEnv) -> Result<()> {
+    if let InheritEnv::Names(names) = inherit {
+        validate_environment_names(names)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn expand(
+    text: &str,
+    env: impl Fn(&str) -> Option<String>,
+    hook_env: &BTreeSet<String>,
+) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${") {
@@ -227,6 +395,9 @@ fn expand(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<String> {
 
         out.push_str(&rest[..start]);
         if is_var_name(name) {
+            if hook_env.contains(name) {
+                bail!("environment variable `{name}` is reserved for hooks");
+            }
             match (env(name), default) {
                 (Some(value), Some(default)) if value.is_empty() => out.push_str(default),
                 (Some(value), _) => out.push_str(&value),
@@ -242,7 +413,7 @@ fn expand(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<String> {
     Ok(out)
 }
 
-fn is_var_name(name: &str) -> bool {
+pub(crate) fn is_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()
@@ -276,6 +447,30 @@ mod tests {
     }
 
     #[test]
+    fn validates_credential_configuration() {
+        let provider =
+            serde_json::json!({"command":"run", "refreshFailure":"revoke", "drainSeconds":0});
+        for server in [
+            serde_json::json!({"command":"${credential:token}"}),
+            serde_json::json!({"command":"run","args":["${credential:token}"]}),
+            serde_json::json!({"url":"https://example.com/${credential:token}"}),
+            serde_json::json!({"command":"run","env":{"T":"${credential:token}"}}),
+            serde_json::json!({"url":"https://example.com","credentials":{"provider":"p","mergeEnv":true}}),
+            serde_json::json!({"command":"run","credentials":{"provider":"missing"}}),
+        ] {
+            let value =
+                serde_json::json!({"credentialProviders":{"p":provider},"mcpServers":{"s":server}});
+            assert!(parse(&value.to_string()).is_err(), "{value}");
+        }
+        let value = serde_json::json!({"credentialProviders":{"p":provider},"mcpServers":{"s":{"command":"run","env":{"T":"Bearer ${credential:token}"},"credentials":{"provider":"p"}}}});
+        assert!(parse(&value.to_string()).is_ok());
+        let value = serde_json::json!({"credentialProviders":{"p":{"command":"run","env":{"T":"${TOKEN}"}}},"mcpServers":{"s":{"command":"run","env":{"T":"${TOKEN}"}}}});
+        assert!(
+            format!("{:#}", parse(&value.to_string()).unwrap_err()).contains("reserved for hooks")
+        );
+    }
+
+    #[test]
     fn infers_stdio_from_command() {
         let server =
             parse_one(serde_json::json!({ "command": "run", "description": "Runs" })).unwrap();
@@ -283,10 +478,13 @@ mod tests {
             server,
             Server {
                 description: Some("Runs".into()),
+                access: None,
+                credentials: None,
                 transport: Transport::Stdio {
                     command: "run".into(),
                     args: vec![],
                     env: BTreeMap::new(),
+                    environment: Environment::default(),
                 },
             }
         );
@@ -391,6 +589,7 @@ mod tests {
                 command: "secret/bin".into(),
                 args: vec!["--key=secret".into()],
                 env: BTreeMap::from([("KEY".into(), "secret".into())]),
+                environment: Environment::default(),
             }
         );
 
@@ -416,6 +615,74 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hook_variables_in_server_fields() {
+        for placeholder in ["${TOKEN}", "${TOKEN:-fallback}", "${MISSING:-fallback}"] {
+            let servers = [
+                serde_json::json!({"command": placeholder}),
+                serde_json::json!({"command": "run", "args": [placeholder]}),
+                serde_json::json!({"command": "run", "env": {"OTHER": placeholder}}),
+                serde_json::json!({"url": format!("https://example.com/{placeholder}")}),
+                serde_json::json!({"url": "https://example.com", "headers": {"Authorization": placeholder}}),
+            ];
+            for server in servers {
+                let config = serde_json::json!({"hookEnv": ["TOKEN", "MISSING"], "mcpServers": {"s": server}});
+                let error = format!("{:#}", parse(&config.to_string()).unwrap_err());
+                assert!(error.contains("reserved for hooks"), "{error}");
+                assert!(!error.contains("secret"), "{error}");
+            }
+        }
+        let config = serde_json::json!({"hookEnv": ["TOKEN"], "mcpServers": {"s": {"command": "run", "env": {"TOKEN": "literal"}}}});
+        assert!(
+            format!("{:#}", parse(&config.to_string()).unwrap_err()).contains("reserved for hooks")
+        );
+    }
+
+    #[test]
+    fn validates_access_policies_and_reserves_hook_placeholders() {
+        for hook in [
+            serde_json::json!({}),
+            serde_json::json!({"command":"run", "http":{"url":"http://localhost"}}),
+            serde_json::json!({"command":"run", "timeoutSeconds":0}),
+            serde_json::json!({"http":{"url":"ftp://localhost"}}),
+            serde_json::json!({"http":{"url":"http://localhost"},"env":{}}),
+        ] {
+            let config = serde_json::json!({"accessPolicies":{"p":hook},"mcpServers":{}});
+            assert!(parse(&config.to_string()).is_err(), "{config}");
+        }
+        assert!(
+            parse(r#"{"mcpServers":{"s":{"command":"run","access":{"policy":"missing"}}}}"#)
+                .is_err()
+        );
+        for hook in [
+            serde_json::json!({"command":"${TOKEN:-fallback}"}),
+            serde_json::json!({"command":"run", "args":["${TOKEN}"]}),
+            serde_json::json!({"command":"run", "env":{"X":"${TOKEN}"}}),
+            serde_json::json!({"http":{"url":"https://example.com/${TOKEN}"}}),
+            serde_json::json!({"http":{"url":"https://example.com", "headers":{"Authorization":"${TOKEN}"}}}),
+        ] {
+            let config = serde_json::json!({"accessPolicies":{"p":hook},"mcpServers":{"s":{"command":"run","args":["${TOKEN}"]}}});
+            let error = format!("{:#}", parse(&config.to_string()).unwrap_err());
+            assert!(error.contains("reserved for hooks"), "{error}");
+            assert!(!error.contains("secret"), "{error}");
+        }
+    }
+
+    #[test]
+    fn validates_environment_settings() {
+        for config in [
+            serde_json::json!({"hookEnv": ["BAD=NAME"], "mcpServers": {}}),
+            serde_json::json!({"hookEnv": true, "mcpServers": {}}),
+            serde_json::json!({"inheritEnv": "PATH", "mcpServers": {}}),
+            serde_json::json!({"inheritEnv": [""], "mcpServers": {}}),
+            serde_json::json!({"mcpServers": {"s": {"command": "run", "inheritEnv": ["BAD=NAME"]}}}),
+            serde_json::json!({"mcpServers": {"s": {"url": "https://example.com", "inheritEnv": false}}}),
+        ] {
+            assert!(parse(&config.to_string()).is_err(), "{config}");
+        }
+        assert!(parse(r#"{"inheritEnv": false, "hookEnv": ["TOKEN"], "mcpServers": {"s": {"url": "https://example.com"}}}"#).is_ok());
+    }
+
+    #[test]
     fn expands_placeholders() {
         let cases = [
             ("${TOKEN}", "secret"),
@@ -433,7 +700,11 @@ mod tests {
             ("ünï${TOKEN}cödé", "ünïsecretcödé"),
         ];
         for (text, expected) in cases {
-            assert_eq!(expand(text, env).unwrap(), expected, "{text}");
+            assert_eq!(
+                expand(text, env, &BTreeSet::new()).unwrap(),
+                expected,
+                "{text}"
+            );
         }
     }
 }

@@ -5,7 +5,7 @@
 mod ipc;
 pub mod worker;
 
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use rmcp::model::CallToolResult;
 use serde::Serialize;
@@ -106,6 +106,10 @@ impl CodeRunner {
 
     /// Runs a script, returning its output as JSON
     pub async fn run(&self, code: String, ct: &CancellationToken) -> Result<String, String> {
+        let ceiling = Arc::new(self.registry.allowed(None, ct).await);
+        if ct.is_cancelled() {
+            return Err("the script was cancelled".into());
+        }
         // The execution runs in its own task, so it still cleans up if this future is
         // dropped: dropping it cancels the execution
         let execution_ct = ct.child_token();
@@ -116,6 +120,7 @@ impl CodeRunner {
             code,
             self.timeout,
             execution_ct,
+            ceiling,
         );
         tokio::spawn(execution)
             .await
@@ -129,6 +134,7 @@ async fn execute(
     code: String,
     timeout: Duration,
     ct: CancellationToken,
+    ceiling: Arc<BTreeSet<String>>,
 ) -> Result<String, String> {
     let mut command = worker();
     command
@@ -195,7 +201,7 @@ async fn execute(
                         continue;
                     }
                     calls_made += 1;
-                    let call = run_call(registry.clone(), id, server_id, tool_name, arguments, ct.clone());
+                    let call = run_call(registry.clone(), id, server_id, tool_name, arguments, ct.clone(), ceiling.clone());
                     calls.spawn(call);
                 }
                 Some(Ok(FromWorker::Complete { result, mut warnings })) => {
@@ -261,7 +267,16 @@ async fn run_call(
     tool_name: String,
     arguments: Value,
     ct: CancellationToken,
+    ceiling: Arc<BTreeSet<String>>,
 ) -> Vec<u8> {
+    if !ceiling.contains(&server_id) {
+        return reply(
+            id,
+            &server_id,
+            &tool_name,
+            Err(format!("unknown server `{server_id}`")),
+        );
+    }
     let outcome = match arguments {
         Value::Object(arguments) => registry.call(&server_id, &tool_name, arguments, &ct).await,
         _ => Err("a tool's arguments must be an object".into()),
@@ -448,15 +463,27 @@ mod tests {
 
     /// A runner whose workers run this shell script, with an empty environment
     fn fake_worker(script: String, timeout: Duration) -> CodeRunner {
+        // Resolve through the test runner's PATH before the worker's environment
+        // is cleared. NixOS does not provide /bin/sleep (or a usable default PATH).
+        let sleep = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("sleep"))
+            .find(|path| path.is_file())
+            .expect("sleep must be available on the test runner's PATH");
         let worker = Arc::new(move || {
             let mut command = Command::new("/bin/sh");
-            command.args(["-c", &script]);
+            command.args(["-c", &script, "gate-test"]).arg(&sleep);
             command
         });
         let config = crate::config::Config {
+            access_policies: Default::default(),
+            credential_providers: Default::default(),
             servers: Default::default(),
         };
-        let registry = Registry::start(&config, Duration::from_secs(1), [Duration::ZERO; 2]);
+        let registry = Registry::start(
+            Arc::new(config),
+            Duration::from_secs(1),
+            [Duration::ZERO; 2],
+        );
         CodeRunner::with_worker(worker, timeout, Arc::new(registry))
     }
 
@@ -590,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn keeps_its_deadline_when_the_worker_stops_reading() {
         // The script is far bigger than a pipe's buffer, so writing it blocks forever
-        let runner = fake_worker("exec /bin/sleep 30".into(), Duration::from_secs(1));
+        let runner = fake_worker(r#"exec "$1" 30"#.into(), Duration::from_secs(1));
         let started = Instant::now();
         let error = run(&runner, &"x".repeat(1024 * 1024)).await.unwrap_err();
         assert_eq!(error, timed_out(Duration::from_secs(1)));
@@ -605,7 +632,7 @@ mod tests {
     fn waiting_worker() -> (CodeRunner, tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
-        let script = format!("echo $$ > '{}'; exec /bin/sleep 30", pid_file.display());
+        let script = format!(r#"echo $$ > '{}'; exec "$1" 30"#, pid_file.display());
         (fake_worker(script, Duration::from_secs(30)), dir, pid_file)
     }
 
