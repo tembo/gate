@@ -123,8 +123,8 @@ struct CallTool {
 
 #[derive(Deserialize, JsonSchema)]
 struct ExecuteCode {
-    /// The body of an async JavaScript function. Its return value, serialized as JSON, is
-    /// the result. Plain JavaScript only, not TypeScript.
+    /// The body of an async JavaScript or TypeScript function. Its return value is
+    /// serialized as JSON. TypeScript is transpiled without type checking.
     code: String,
 }
 
@@ -282,7 +282,7 @@ impl Gate {
     }
 
     #[tool(
-        description = "Run JavaScript, returning its result as JSON along with anything it logged"
+        description = "Run JavaScript or TypeScript, returning its result as JSON along with anything it logged"
     )]
     async fn execute_mcp_code(
         &self,
@@ -304,7 +304,62 @@ impl Gate {
 }
 
 #[tool_handler]
-impl ServerHandler for Gate {}
+impl ServerHandler for Gate {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        let settings = &self.config.gateway;
+        let mut identity = rmcp::model::Implementation::new(&settings.name, &settings.version);
+        identity.title = settings.title.clone();
+        let mut info = rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(identity);
+        info.instructions = settings.instructions.clone();
+        info
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let cache_hints = context
+            .protocol_version()
+            .is_some_and(|v| v >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let tools = Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| self.describe_tool(tool))
+            .collect();
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            ttl_ms: cache_hints.then_some(0),
+            cache_scope: cache_hints.then_some(rmcp::model::CacheScope::Public),
+            ..Default::default()
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        Self::tool_router()
+            .get(name)
+            .cloned()
+            .map(|tool| self.describe_tool(tool))
+    }
+}
+impl Gate {
+    fn describe_tool(&self, mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
+        if let Some(description) = self
+            .config
+            .gateway
+            .tool_descriptions
+            .get(tool.name.as_ref())
+        {
+            tool.description = Some(description.clone().into());
+        }
+        tool
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     // `execute_mcp_code` runs each script in gate itself, started as a worker

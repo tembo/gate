@@ -1309,7 +1309,7 @@ async fn reports_script_errors() {
     let gateway = Gateway::start(json!({}), &[]).await;
     let cases = [
         (r#"console.log("before"); throw new Error("boom");"#, "boom"),
-        ("return (", "unexpected token"),
+        ("return (", "SyntaxError"),
         ("const a = {}; a.self = a; return a;", "circular"),
         ("return 1n;", "BigInt"),
         ("return () => 1;", "isn't JSON-serializable"),
@@ -2696,4 +2696,137 @@ async fn ordinary_reconnect_reuses_an_unexpired_lease() {
     wait_for_new_pid(&pid_file, &old).await;
     gateway.wait_for_status("s", "ready").await;
     assert!(provider.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn advertises_configured_gateway_metadata() {
+    let gateway=Gateway::spawn_config(json!({
+        "gateway":{"name":"tembo-mcp-gateway","version":"test","title":"Tembo tools","instructions":"Use the search tool first. ${TOKEN}","toolDescriptions":{"execute_mcp_code":"Run a Tembo script"}},
+        "mcpServers":{}
+    }), &[], &[], Stdio::inherit()).await.0;
+    let info = gateway.client.peer_info().unwrap();
+    assert_eq!(info.server_info.as_ref().unwrap().name, "tembo-mcp-gateway");
+    assert_eq!(info.server_info.as_ref().unwrap().version, "test");
+    assert_eq!(
+        info.server_info.as_ref().unwrap().title.as_deref(),
+        Some("Tembo tools")
+    );
+    assert_eq!(
+        info.instructions.as_deref(),
+        Some("Use the search tool first. ${TOKEN}")
+    );
+    let tools = gateway.client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 5);
+    let execute = tools
+        .iter()
+        .find(|tool| tool.name == "execute_mcp_code")
+        .unwrap();
+    assert_eq!(execute.description.as_deref(), Some("Run a Tembo script"));
+    assert_eq!(execute.input_schema["properties"]["code"]["type"], "string");
+    assert_eq!(gateway.run_code("return 7").await.0, json!({"result":7}));
+    let default = Gateway::start(json!({}), &[]).await;
+    assert_eq!(
+        default
+            .client
+            .peer_info()
+            .unwrap()
+            .server_info
+            .as_ref()
+            .unwrap()
+            .name,
+        "gate"
+    );
+}
+
+#[tokio::test]
+async fn runs_typescript_and_web_api_compatibility_fixtures() {
+    let fixtures: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/code-compat.json")).unwrap();
+    let gateway = Gateway::start(json!({}), &[]).await;
+    for fixture in fixtures {
+        let (result, error) = gateway.run_code(fixture["code"].as_str().unwrap()).await;
+        assert!(!error, "{}: {result}", fixture["name"]);
+        assert_eq!(result["result"], fixture["expected"], "{}", fixture["name"]);
+    }
+}
+
+#[tokio::test]
+async fn timers_are_bounded_and_do_not_keep_finished_scripts_alive() {
+    let gateway = Gateway::spawn(json!({}), &[], &["--code-timeout", "1"], Stdio::inherit())
+        .await
+        .0;
+    let (result, error) = timeout(
+        Duration::from_secs(2),
+        gateway.run_code("setTimeout(() => console.log('late'), 30000); return 1;"),
+    )
+    .await
+    .unwrap();
+    assert!(!error, "{result}");
+    assert_eq!(result, json!({"result":1}));
+    let error = gateway
+        .code_error("await new Promise(resolve => setTimeout(resolve, 30000));")
+        .await;
+    assert!(error.contains("timed out"), "{error}");
+    let error = gateway
+        .code_error("for (let i=0; i<257; i++) setTimeout(() => {}, 30000);")
+        .await;
+    assert!(error.contains("256 timers"), "{error}");
+    let (result, error) = gateway
+        .run_code("for (let i=0; i<500; i++) clearTimeout(setTimeout(() => {}, 30000)); return 1;")
+        .await;
+    assert!(!error, "{result}");
+}
+
+#[tokio::test]
+async fn typescript_errors_refer_to_the_snippet_and_calls_still_work() {
+    let server = serve_echo().await;
+    let gateway = Gateway::start(json!({"echo":echo(&server.url)}), &[TOKEN]).await;
+    gateway.wait_for_status("echo", "ready").await;
+    let (result, error) = gateway
+        .run_code("const result: unknown = await mcp.echo.echo(); return result;")
+        .await;
+    assert!(!error, "{result}");
+    assert_eq!(result["result"]["content"][0]["text"], "echo");
+    let error = gateway
+        .code_error("const x: number = 1;\nconst y: = 2; return x;")
+        .await;
+    assert!(error.contains("line 2"), "{error}");
+}
+
+#[tokio::test]
+async fn plain_http_servers_reuse_tcp_connections() {
+    use axum::extract::ConnectInfo;
+    let peers = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let observed = peers.clone();
+    let router=axum::Router::new().route("/mcp",axum::routing::post(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, axum::Json(body): axum::Json<Value>| {
+        observed.lock().unwrap().insert(peer);
+        async move {
+            if body.get("id").is_none() { return StatusCode::ACCEPTED.into_response(); }
+            let result=match body["method"].as_str().unwrap_or("") {
+                "initialize" => json!({"protocolVersion":body["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"pool-test","version":"1"}}),
+                "tools/list" => json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
+                "tools/call" => json!({"content":[{"type":"text","text":"ok"}]}),
+                _ => return axum::Json(json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32601,"message":"unknown method"}})).into_response(),
+            };
+            axum::Json(json!({"jsonrpc":"2.0","id":body["id"],"result":result})).into_response()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let gateway = Gateway::start(json!({"s":{"url":url}}), &[]).await;
+    gateway.wait_for_status("s", "ready").await;
+    peers.lock().unwrap().clear();
+    for _ in 0..5 {
+        assert!(!gateway.call("call_mcp_tool", tool_call("echo")).await.1);
+    }
+    assert_eq!(peers.lock().unwrap().len(), 1);
+    task.abort();
 }

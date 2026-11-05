@@ -1,8 +1,10 @@
-//! `execute_mcp_code`: runs a JavaScript snippet in a fresh worker process and returns its
+//! `execute_mcp_code`: runs a JavaScript or TypeScript snippet in a fresh worker process and returns its
 //! result, so an agent can combine several steps without every intermediate result passing
 //! through its context.
 
 mod ipc;
+mod typescript;
+mod web;
 pub mod worker;
 
 use std::{collections::BTreeSet, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
@@ -24,7 +26,7 @@ use crate::registry::Registry;
 
 /// Starts gate as a code worker instead of a gateway
 pub const WORKER_FLAG: &str = "--code-worker";
-/// The most JavaScript source a script can have
+/// The most script source a script can have
 pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// The most a script's output can take once serialized: its result, logs and warnings
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -475,6 +477,7 @@ mod tests {
             command
         });
         let config = crate::config::Config {
+            gateway: Default::default(),
             access_policies: Default::default(),
             credential_providers: Default::default(),
             servers: Default::default(),
