@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, anyhow, bail};
 use rquickjs::{
     AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Exception, Function, Promise,
-    Value, function::Async,
+    Value, context::EvalOptions, function::Async,
 };
 use tokio::{io::Stdin, sync::oneshot};
 
@@ -263,13 +263,25 @@ async fn execute(
     let mut timers = None;
     let outcome = context
         .async_with(async |ctx| {
-            let describe = |error: CaughtError<'_>| describe(error, deadline, timeout);
+            let describe =
+                |error: CaughtError<'_>| describe(error, deadline, timeout, &source, None);
             timers = Some(super::web::install(&ctx).catch(&ctx).map_err(describe)?);
             install_log(&ctx).catch(&ctx).map_err(describe)?;
             install_call(&ctx, calls).catch(&ctx).map_err(describe)?;
             ctx.eval::<(), _>(PRELUDE).catch(&ctx).map_err(describe)?;
 
-            let promise: Promise = ctx.eval(source).catch(&ctx).map_err(describe)?;
+            let format_thrown: Function = ctx
+                .eval(include_str!("thrown.js"))
+                .catch(&ctx)
+                .map_err(describe)?;
+            let describe =
+                |error| self::describe(error, deadline, timeout, &source, Some(&format_thrown));
+            let mut options = EvalOptions::default();
+            options.filename = Some(super::typescript::GENERATED_FILENAME.into());
+            let promise: Promise = ctx
+                .eval_with_options(source.code.as_bytes(), options)
+                .catch(&ctx)
+                .map_err(describe)?;
             let value: Value = promise.into_future().await.catch(&ctx).map_err(describe)?;
             let globals = ctx.globals();
             let serialize: Function = globals
@@ -319,7 +331,13 @@ fn install_log(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     ctx.globals().set("__gateLog", log)
 }
 
-fn describe(error: CaughtError<'_>, deadline: Instant, timeout: Duration) -> String {
+fn describe<'js>(
+    error: CaughtError<'js>,
+    deadline: Instant,
+    timeout: Duration,
+    source: &super::typescript::CompiledScript,
+    format_thrown: Option<&Function<'js>>,
+) -> String {
     // The interrupt handler stops the script with an uncatchable error
     if Instant::now() >= deadline {
         return timed_out(timeout);
@@ -334,9 +352,38 @@ fn describe(error: CaughtError<'_>, deadline: Instant, timeout: Duration) -> Str
         // QuickJS sometimes reports a failed allocation as a thrown `null`, but scripts can
         // throw `null` too, so this is only a guess
         CaughtError::Value(value) if value.is_null() => format!(
-            "the script threw `null`, possibly because it ran out of memory (the limit is {} MiB)",
+            "Thrown: null (possibly because the script ran out of memory; the limit is {} MiB)",
             MEMORY_LIMIT_BYTES / 1024 / 1024
         ),
+        CaughtError::Exception(exception) => {
+            let name = exception
+                .as_object()
+                .get::<_, String>("name")
+                .catch(exception.as_object().ctx())
+                .ok()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "Error".into());
+            let mut error = format!("{name}:");
+            if let Some(message) = exception.message() {
+                error.push(' ');
+                error.push_str(&message);
+            }
+            if let Some(stack) = exception.stack() {
+                error.push('\n');
+                error.push_str(&source.map_stack(&stack));
+            }
+            error
+        }
+        CaughtError::Value(value) => {
+            let formatted = format_thrown
+                .and_then(|format| format.call::<_, String>((value,)).catch(format.ctx()).ok())
+                .unwrap_or_else(|| "[value could not be formatted]".into());
+            if Instant::now() >= deadline {
+                timed_out(timeout)
+            } else {
+                format!("Thrown: {formatted}")
+            }
+        }
         error => error.to_string(),
     }
 }

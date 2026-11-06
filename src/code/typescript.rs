@@ -2,18 +2,75 @@
 use oxc::{
     allocator::Allocator,
     ast::AstKind,
-    codegen::Codegen,
+    codegen::{Codegen, CodegenOptions},
     diagnostics::OxcDiagnostic,
     parser::Parser,
     semantic::SemanticBuilder,
     span::SourceType,
     transformer::{TransformOptions, Transformer},
 };
-use std::path::Path;
+use std::{path::Path, sync::LazyLock};
 
 const PREFIX: &str = "(async () => {\n";
+pub const GENERATED_FILENAME: &str = "gate-script.js";
 
-pub fn compile(code: &str) -> Result<String, String> {
+#[derive(Debug)]
+pub struct CompiledScript {
+    pub code: String,
+    map: oxc_sourcemap::SourceMap,
+    source_lines: u32,
+    wrapper_frame: String,
+}
+
+impl CompiledScript {
+    /// Map this compilation's script frames and omit its outer wrapper frame.
+    /// Preserve error messages and locations from runtime helpers or dynamic eval.
+    pub fn map_stack(&self, stack: &str) -> String {
+        static FRAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?m)^([ \t]+at (?:[^\r\n]* \()?)gate-script\.js:([0-9]+):([0-9]+)(\)?[ \t]*)$",
+            )
+            .expect("valid stack frame pattern")
+        });
+        let lookup = self.map.generate_lookup_table();
+        // Only the outer invocation of our generated async function has this
+        // exact frame. User functions and dynamic eval frames remain visible.
+        let stack: String = stack
+            .split_inclusive('\n')
+            .filter(|line| line.trim() != self.wrapper_frame)
+            .collect();
+        FRAME
+            .replace_all(&stack, |frame: &regex::Captures<'_>| {
+                let location = frame[2]
+                    .parse::<u32>()
+                    .ok()
+                    .zip(frame[3].parse::<u32>().ok())
+                    .and_then(|(line, column)| {
+                        self.map
+                            .lookup_token(&lookup, line.checked_sub(1)?, column.checked_sub(1)?)
+                    })
+                    .filter(|token| {
+                        token.get_source_id().is_some()
+                            && (1..=self.source_lines).contains(&token.get_src_line())
+                    });
+                match location {
+                    // Source-map lines are zero-based. Removing the wrapper's first
+                    // line makes these the snippet's one-based line numbers.
+                    Some(token) => format!(
+                        "{}script.ts:{}:{}{}",
+                        &frame[1],
+                        token.get_src_line(),
+                        token.get_src_col() + 1,
+                        &frame[4]
+                    ),
+                    None => frame[0].to_owned(),
+                }
+            })
+            .into_owned()
+    }
+}
+
+pub fn compile(code: &str) -> Result<CompiledScript, String> {
     let source = format!("{PREFIX}{code}\n}})()");
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, &source, SourceType::ts().with_script(true)).parse();
@@ -61,7 +118,22 @@ pub fn compile(code: &str) -> Result<String, String> {
     {
         return Err("unsupported script syntax: external modules and transform runtime helpers are not available".into());
     }
-    Ok(Codegen::new().build(&program).code)
+    let output = Codegen::new()
+        .with_options(CodegenOptions {
+            source_map_path: Some("script.ts".into()),
+            ..Default::default()
+        })
+        .build(&program);
+    let wrapper_frame = format!(
+        "at <eval> ({GENERATED_FILENAME}:{}:1)",
+        output.code.lines().count()
+    );
+    Ok(CompiledScript {
+        wrapper_frame,
+        code: output.code,
+        map: output.map.expect("source maps are enabled"),
+        source_lines: code.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1,
+    })
 }
 
 fn diagnostic(error: &OxcDiagnostic, source: &str, code_len: usize) -> String {
@@ -110,6 +182,23 @@ mod tests {
                 "unsupported script syntax: decorators are not supported",
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn leaves_unmapped_stack_locations_unchanged() {
+        let script = compile("throw new Error('boom');").unwrap();
+        for stack in [
+            "    at <anonymous> (eval_script:2:11)\n",
+            "    at <eval> (<input>:1:11)\n",
+            "    at <eval> (gate-script.js:1:1)\n",
+            "    at <eval> (gate-script.js:999:1)\n",
+            "    at <eval> (gate-script.js:0:0)\n",
+            "    at <eval> (gate-script.js:999999999999999999999:1)\n",
+            "    at native (native)\n",
+            "a message mentioning gate-script.js:2:11",
+        ] {
+            assert_eq!(script.map_stack(stack), stack);
         }
     }
 }
