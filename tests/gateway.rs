@@ -1305,6 +1305,65 @@ async fn warns_about_unhandled_rejections() {
 }
 
 #[tokio::test]
+async fn maps_runtime_errors_to_the_original_script() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    for (code, locations) in [
+        (
+            "const x = 1;\n\nthrow new Error('boom');",
+            vec!["script.ts:3:11"],
+        ),
+        (
+            "interface X {\n value: string;\n}\nconst value: X = {value:'x'};\nthrow new Error('typed');",
+            vec!["script.ts:5:11"],
+        ),
+        (
+            "function fail(): never {\n throw new Error('nested');\n}\nawait Promise.resolve();\nfail();",
+            vec!["at fail (script.ts:2:12)", "script.ts:5:1"],
+        ),
+        (
+            "const x: string = '😀'; throw new Error('unicode');",
+            vec!["script.ts:1:35"],
+        ),
+        (
+            "enum Mode { A, B }\nclass X { constructor(public x: number) {} }\nthrow new Error('enum');",
+            vec!["script.ts:3:11"],
+        ),
+        (
+            "await new Promise((resolve, reject) => {\nsetTimeout(() => reject(new Error('timer')), 1);\n});",
+            vec!["script.ts:2:29"],
+        ),
+        (
+            "interface X { value: string }\nreturn { toJSON() { throw new Error('serialization'); } };",
+            vec!["script.ts:2:31"],
+        ),
+    ] {
+        let error = gateway.code_error(code).await;
+        for location in locations {
+            assert!(error.contains(location), "{code}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn keeps_runtime_error_messages_and_other_sources_intact() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    let error = gateway
+        .code_error("throw new Error('literal location\\n    at fake (gate-script.js:2:11)');")
+        .await;
+    assert!(
+        error.starts_with("Error: literal location\n    at fake (gate-script.js:2:11)\n"),
+        "{error}"
+    );
+    assert!(error.contains("at <anonymous> (script.ts:1:"), "{error}");
+
+    let error = gateway
+        .code_error("eval(\"throw new Error('eval')\");")
+        .await;
+    assert!(error.contains("at <eval> (<input>:1:11)"), "{error}");
+    assert!(error.contains("at <anonymous> (script.ts:1:1)"), "{error}");
+}
+
+#[tokio::test]
 async fn reports_script_errors() {
     let gateway = Gateway::start(json!({}), &[]).await;
     let cases = [

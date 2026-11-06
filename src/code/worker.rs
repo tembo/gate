@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context as _, anyhow, bail};
 use rquickjs::{
     AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Exception, Function, Promise,
-    Value, function::Async,
+    Value, context::EvalOptions, function::Async,
 };
 use tokio::{io::Stdin, sync::oneshot};
 
@@ -263,13 +263,18 @@ async fn execute(
     let mut timers = None;
     let outcome = context
         .async_with(async |ctx| {
-            let describe = |error: CaughtError<'_>| describe(error, deadline, timeout);
+            let describe = |error: CaughtError<'_>| describe(error, deadline, timeout, &source);
             timers = Some(super::web::install(&ctx).catch(&ctx).map_err(describe)?);
             install_log(&ctx).catch(&ctx).map_err(describe)?;
             install_call(&ctx, calls).catch(&ctx).map_err(describe)?;
             ctx.eval::<(), _>(PRELUDE).catch(&ctx).map_err(describe)?;
 
-            let promise: Promise = ctx.eval(source).catch(&ctx).map_err(describe)?;
+            let mut options = EvalOptions::default();
+            options.filename = Some(super::typescript::GENERATED_FILENAME.into());
+            let promise: Promise = ctx
+                .eval_with_options(source.code.as_bytes(), options)
+                .catch(&ctx)
+                .map_err(describe)?;
             let value: Value = promise.into_future().await.catch(&ctx).map_err(describe)?;
             let globals = ctx.globals();
             let serialize: Function = globals
@@ -319,7 +324,12 @@ fn install_log(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     ctx.globals().set("__gateLog", log)
 }
 
-fn describe(error: CaughtError<'_>, deadline: Instant, timeout: Duration) -> String {
+fn describe(
+    error: CaughtError<'_>,
+    deadline: Instant,
+    timeout: Duration,
+    source: &super::typescript::CompiledScript,
+) -> String {
     // The interrupt handler stops the script with an uncatchable error
     if Instant::now() >= deadline {
         return timed_out(timeout);
@@ -337,6 +347,18 @@ fn describe(error: CaughtError<'_>, deadline: Instant, timeout: Duration) -> Str
             "the script threw `null`, possibly because it ran out of memory (the limit is {} MiB)",
             MEMORY_LIMIT_BYTES / 1024 / 1024
         ),
+        CaughtError::Exception(exception) => {
+            let mut error = String::from("Error:");
+            if let Some(message) = exception.message() {
+                error.push(' ');
+                error.push_str(&message);
+            }
+            if let Some(stack) = exception.stack() {
+                error.push('\n');
+                error.push_str(&source.map_stack(&stack));
+            }
+            error
+        }
         error => error.to_string(),
     }
 }
