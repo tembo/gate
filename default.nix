@@ -5,31 +5,35 @@
 {
   lib,
   rustPlatform,
-}:
-rustPlatform.buildRustPackage {
-  pname = "gate";
-  inherit ((lib.importTOML ./Cargo.toml).package) version;
+}: let
+  cargoToml = lib.importTOML ./Cargo.toml;
+  # The executable is named after the package, unless Cargo.toml names it with [[bin]]
+  binary = (builtins.head (cargoToml.bin or [{inherit (cargoToml.package) name;}])).name;
+in
+  rustPlatform.buildRustPackage {
+    pname = cargoToml.package.name;
+    inherit (cargoToml.package) version;
 
-  src = lib.fileset.toSource {
-    root = ./.;
-    fileset = lib.fileset.unions [
-      ./Cargo.toml
-      ./Cargo.lock
-      ./src
-    ];
-  };
+    src = lib.fileset.toSource {
+      root = ./.;
+      fileset = lib.fileset.unions [
+        ./Cargo.toml
+        ./Cargo.lock
+        ./src
+      ];
+    };
 
-  cargoLock.lockFile = ./Cargo.lock;
+    cargoLock.lockFile = ./Cargo.lock;
 
-  # The tests start servers and child processes, and live in tests/, which isn't part of
-  # src. CI runs them on every pull request.
-  doCheck = false;
+    # The tests start servers and child processes, and live in tests/, which isn't part of
+    # src. CI runs them on every pull request.
+    doCheck = false;
 
-  meta = {
-    description = "MCP gateway: one MCP server that searches, inspects and calls the tools of many others";
-    homepage = "https://github.com/tembo/gate";
-    license = lib.licenses.mit;
-    mainProgram = "gate";
-    platforms = lib.platforms.linux ++ lib.platforms.darwin;
-  };
-}
+    meta = {
+      description = "MCP gateway: one MCP server that searches, inspects and calls the tools of many others";
+      homepage = "https://github.com/tembo/gate";
+      license = lib.licenses.mit;
+      mainProgram = binary;
+      platforms = lib.platforms.linux ++ lib.platforms.darwin;
+    };
+  }

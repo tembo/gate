@@ -71,5 +71,13 @@ jobs:
         run: nix-build -E '(import <nixpkgs> {}).callPackage ./default.nix {}'
       - name: Smoke test
         run: |
-          ./result/bin/gate --version
-          python3 scripts/smoke-test.py result/bin/gate
+          set -euo pipefail
+          program="$(nix-instantiate --eval --json -E '((import <nixpkgs> {}).callPackage ./default.nix {}).meta.mainProgram' | jq -r .)"
+          binary="result/bin/$program"
+          if [ ! -x "$binary" ]; then
+            echo "::error::default.nix's meta.mainProgram doesn't name an executable in result/bin."
+            ls result/bin
+            exit 1
+          fi
+          "$binary" --version
+          python3 scripts/smoke-test.py "$binary"
