@@ -14,7 +14,7 @@ sha2 = "0.10.9"
 sse-stream = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "macros", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
-rquickjs = { version = "0.14", default-features = false, features = ["futures"] }
+rquickjs = { version = "0.14", default-features = false, features = ["futures", "std"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -23,6 +23,7 @@ tokio-util = "0.7.20"
 url = "2.5.8"
 # Keep Oxc and its locked browserslist dependency compatible with the existing compiler.
 oxc = { version = "=0.120.0", default-features = false, features = ["semantic", "transformer", "codegen"] }
+oxc_sourcemap = "6.1.1"
 
 [dev-dependencies]
 axum = "0.8.9"
