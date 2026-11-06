@@ -996,15 +996,11 @@ async fn connect(
                 config.channel_buffer_capacity = HTTP_CONCURRENT_REQUESTS;
                 config
             };
-            if auth.enabled() {
-                handshake(StreamableHttpClientTransport::with_client(
-                    crate::credential_http::HttpClient::new(auth)?,
-                    config,
-                ))
-                .await
-            } else {
-                handshake(StreamableHttpClientTransport::from_config(config)).await
-            }
+            handshake(StreamableHttpClientTransport::with_client(
+                crate::credential_http::HttpClient::new(auth)?,
+                config,
+            ))
+            .await
         }
     }
 }
@@ -1148,6 +1144,7 @@ mod tests {
         };
         let registry = Registry {
             access: crate::access::AccessPolicies::new(Arc::new(Config {
+                gateway: Default::default(),
                 access_policies: BTreeMap::new(),
                 credential_providers: BTreeMap::new(),
                 servers: BTreeMap::from([(
@@ -1282,6 +1279,7 @@ mod tests {
             },
         };
         let config = Config {
+            gateway: Default::default(),
             access_policies: BTreeMap::new(),
             credential_providers: BTreeMap::new(),
             servers: BTreeMap::from([("s".to_owned(), server)]),

@@ -238,12 +238,16 @@ async fn execute(
     timeout: Duration,
     calls: SharedCalls,
 ) -> Result<(serde_json::Value, Vec<String>), String> {
+    let deadline = Instant::now() + timeout;
+    let source = super::typescript::compile(code)?;
+    if Instant::now() >= deadline {
+        return Err(timed_out(timeout));
+    }
     let failed = |error: rquickjs::Error| format!("can't start the JavaScript engine: {error}");
     let runtime = AsyncRuntime::new().map_err(failed)?;
     runtime.set_memory_limit(MEMORY_LIMIT_BYTES).await;
     runtime.set_max_stack_size(STACK_LIMIT_BYTES).await;
     // Stops CPU-bound code. The parent has its own deadline for scripts that just wait.
-    let deadline = Instant::now() + timeout;
     runtime
         .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
         .await;
@@ -256,14 +260,15 @@ async fn execute(
         .await;
     let context = AsyncContext::full(&runtime).await.map_err(failed)?;
 
+    let mut timers = None;
     let outcome = context
         .async_with(async |ctx| {
             let describe = |error: CaughtError<'_>| describe(error, deadline, timeout);
+            timers = Some(super::web::install(&ctx).catch(&ctx).map_err(describe)?);
             install_log(&ctx).catch(&ctx).map_err(describe)?;
             install_call(&ctx, calls).catch(&ctx).map_err(describe)?;
             ctx.eval::<(), _>(PRELUDE).catch(&ctx).map_err(describe)?;
 
-            let source = format!("(async () => {{\n{code}\n}})()");
             let promise: Promise = ctx.eval(source).catch(&ctx).map_err(describe)?;
             let value: Value = promise.into_future().await.catch(&ctx).map_err(describe)?;
             let globals = ctx.globals();
@@ -289,6 +294,9 @@ async fn execute(
             Ok((json, warnings))
         })
         .await;
+    if let Some(timers) = timers {
+        timers.cancel_all();
+    }
     let (json, warnings) = outcome?;
     let result = serde_json::from_str(&json).map_err(|error| format!("invalid result: {error}"))?;
     Ok((result, warnings))

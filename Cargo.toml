@@ -21,6 +21,8 @@ serde_json = "1.0.154"
 tokio = { version = "1.53.3", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7.20"
 url = "2.5.8"
+# Keep Oxc and its locked browserslist dependency compatible with the existing compiler.
+oxc = { version = "=0.120.0", default-features = false, features = ["semantic", "transformer", "codegen"] }
 
 [dev-dependencies]
 axum = "0.8.9"

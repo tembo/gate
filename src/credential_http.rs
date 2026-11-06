@@ -30,9 +30,6 @@ impl AuthResponses {
             on_rejected: Some(Arc::new(on_rejected)),
         }
     }
-    pub fn enabled(&self) -> bool {
-        self.on_rejected.is_some()
-    }
     pub fn during_setup(&self) -> bool {
         self.rejected.load(Ordering::Acquire)
     }

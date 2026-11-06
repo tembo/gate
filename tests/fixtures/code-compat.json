@@ -1,0 +1,176 @@
+[
+  {
+    "name": "annotations",
+    "code": "const value: number = 42; return value;",
+    "expected": 42
+  },
+  {
+    "name": "interfaces and generics",
+    "code": "interface Item { value: number }; function first<T>(items: T[]): T { return items[0]; } const items: Item[] = [{value: 7}]; return first(items).value;",
+    "expected": 7
+  },
+  {
+    "name": "assertions and satisfies",
+    "code": "type Item = { value: string }; const item = {value:'yes'} satisfies Item; const maybe: Item | null = item; return (maybe! as Item).value;",
+    "expected": "yes"
+  },
+  {
+    "name": "enums",
+    "code": "enum Status { Pending, Ready = 3 }; enum Label { Good = 'good' }; return [Status.Ready, Status[0], Label.Good];",
+    "expected": [
+      3,
+      "Pending",
+      "good"
+    ]
+  },
+  {
+    "name": "const enums",
+    "code": "const enum Bits { Read = 1, Write = 2 }; return Bits.Read | Bits.Write;",
+    "expected": 3
+  },
+  {
+    "name": "parameter properties",
+    "code": "class Item { constructor(public name: string, private count: number) {} total(): number { return this.count; } }; const item = new Item('test', 4); return [item.name, item.total()];",
+    "expected": [
+      "test",
+      4
+    ]
+  },
+  {
+    "name": "type annotations do not check types",
+    "code": "const value: number = 'unchanged'; return value;",
+    "expected": "unchanged"
+  },
+  {
+    "name": "timer arguments",
+    "code": "return await new Promise(resolve => setTimeout((a,b) => resolve(a+b), 5, 2, 3));",
+    "expected": 5
+  },
+  {
+    "name": "cleared timer",
+    "code": "let changed = false; const id = setTimeout(() => changed = true, 1); clearTimeout(id); await new Promise(resolve => setTimeout(resolve, 5)); return changed;",
+    "expected": false
+  },
+  {
+    "name": "interval",
+    "code": "return await new Promise(resolve => { let n = 0; const id = setInterval(() => { if (++n === 3) { clearInterval(id); resolve(n); } }, 1); });",
+    "expected": 3
+  },
+  {
+    "name": "URL relative and query",
+    "code": "const u = new URL('../a?x=1#f', 'https://example.com/b/c'); u.searchParams.append('x','two words'); return [u.href, u.origin, u.pathname, u.searchParams.getAll('x')];",
+    "expected": [
+      "https://example.com/a?x=1&x=two+words#f",
+      "https://example.com",
+      "/a",
+      [
+        "1",
+        "two words"
+      ]
+    ]
+  },
+  {
+    "name": "URL setters and live params",
+    "code": "const u = new URL('https://example.com:443/path'); const params = u.searchParams; u.search = '?b=2&a=1&a=3'; params.sort(); params.delete('a','1'); u.hostname = 'other.example'; u.port = '8080'; u.hash = 'hello world'; return [u.href, [...params], URL.canParse('no'), URL.parse('no')];",
+    "expected": [
+      "https://other.example:8080/path?a=3&b=2#hello%20world",
+      [
+        [
+          "a",
+          "3"
+        ],
+        [
+          "b",
+          "2"
+        ]
+      ],
+      false,
+      null
+    ]
+  },
+  {
+    "name": "URL unicode",
+    "code": "return new URL('https://m\u00fcnich.example/\u00e9').href;",
+    "expected": "https://xn--mnich-kva.example/%C3%A9"
+  },
+  {
+    "name": "query encoding",
+    "code": "const p = new URLSearchParams([['x','a b'],['x','+'],['z','\ud83d\ude00']]); return [p.toString(), p.size, p.has('x','+'), [...p.keys()]];",
+    "expected": [
+      "x=a+b&x=%2B&z=%F0%9F%98%80",
+      3,
+      true,
+      [
+        "x",
+        "x",
+        "z"
+      ]
+    ]
+  },
+  {
+    "name": "UTF-8 encoding",
+    "code": "return [...new TextEncoder().encode('A\u00e9\ud83d\ude00\\ud800')];",
+    "expected": [
+      65,
+      195,
+      169,
+      240,
+      159,
+      152,
+      128,
+      239,
+      191,
+      189
+    ]
+  },
+  {
+    "name": "encodeInto boundaries",
+    "code": "const e = new TextEncoder(); const a = new Uint8Array(3); const b = new Uint8Array(5); return [e.encodeInto('\ud83d\ude00', a), [...a], e.encodeInto('A\ud83d\ude00B', b), [...b], e.encoding];",
+    "expected": [
+      {
+        "read": 0,
+        "written": 0
+      },
+      [
+        0,
+        0,
+        0
+      ],
+      {
+        "read": 3,
+        "written": 5
+      },
+      [
+        65,
+        240,
+        159,
+        152,
+        128
+      ],
+      "utf-8"
+    ],
+    "bunExpected": [
+      {
+        "read": 1,
+        "written": 3
+      },
+      [
+        239,
+        191,
+        189
+      ],
+      {
+        "read": 3,
+        "written": 5
+      },
+      [
+        65,
+        240,
+        159,
+        152,
+        128
+      ],
+      "utf-8"
+    ]
+  }
+]
