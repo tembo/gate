@@ -37,7 +37,7 @@ const MAX_SEARCH_RESULTS: usize = 50;
 const DEFAULT_SEARCH_RESULTS: usize = 20;
 
 #[derive(Parser)]
-#[command(about = "WIP MCP gateway")]
+#[command(about = "WIP MCP gateway", version)]
 struct Args {
     /// Path to the config file, in the `mcpServers` format
     #[arg(long, short)]

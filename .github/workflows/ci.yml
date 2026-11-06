@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (rustfmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+
+  # The oldest Rust that `rust-version` in Cargo.toml promises
+  msrv:
+    name: Rust 1.92
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check
+        run: cargo check --locked --all-targets
+
+  # default.nix is how Nix users, including Tembo's sandbox image, build gate. Builds it the
+  # way they do, so a dependency change that Nix can't build fails here.
+  nix:
+    name: Nix package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Build
+        run: nix-build -E '(import <nixpkgs> {}).callPackage ./default.nix {}'
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          program="$(nix-instantiate --eval --json -E '((import <nixpkgs> {}).callPackage ./default.nix {}).meta.mainProgram' | jq -r .)"
+          binary="result/bin/$program"
+          if [ ! -x "$binary" ]; then
+            echo "::error::default.nix's meta.mainProgram doesn't name an executable in result/bin."
+            ls result/bin
+            exit 1
+          fi
+          "$binary" --version
+          python3 scripts/smoke-test.py "$binary"
