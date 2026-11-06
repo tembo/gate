@@ -2,6 +2,8 @@
 name = "gate"
 version = "0.1.0"
 edition = "2024"
+# Oxc 0.120 needs 1.92
+rust-version = "1.92"
 
 [dependencies]
 anyhow = "1.0.104"

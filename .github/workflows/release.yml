@@ -1,0 +1,172 @@
+name: Release
+
+# Builds gate for Linux (static, musl) and macOS, on x86_64 and arm64.
+#
+# Pull requests that touch the build check that every target still builds and passes the
+# smoke test. Pushing a version tag (v0.2.0, ...) also creates the GitHub release, with the
+# archives and their SHA-256 checksums attached and GitHub's generated notes (the pull
+# requests merged since the previous tag). Bump `version` in Cargo.toml on main first; the tag
+# has to match it.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'scripts/smoke-test.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read the version from Cargo.toml."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static, so they run on any distribution
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runs-on: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runs-on: macos-latest
+          # Cross-compiled on the arm64 runner, so it can't run there
+          - target: x86_64-apple-darwin
+            runs-on: macos-latest
+            cross: true
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == *-musl ]]; then
+            # aws-lc-sys, ring and QuickJS compile C, which needs the musl C compiler
+            export "CC_${TARGET//-/_}=musl-gcc"
+          fi
+          cargo build --locked --release --target "$TARGET"
+
+      - name: Check the binary is static
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          set -euo pipefail
+          if readelf -l "target/$TARGET/release/gate" | grep -q INTERP; then
+            echo "::error::target/$TARGET/release/gate needs a dynamic loader."
+            exit 1
+          fi
+
+      # Runs a TypeScript script through execute_mcp_code, which starts the binary again as a
+      # code worker
+      - name: Smoke test
+        if: ${{ !matrix.cross }}
+        run: |
+          set -euo pipefail
+          built="target/$TARGET/release/gate"
+          actual="$("$built" --version)"
+          if [ "$actual" != "gate $VERSION" ]; then
+            echo "::error::$built reports $actual, expected gate $VERSION."
+            exit 1
+          fi
+          python3 scripts/smoke-test.py "$built"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="gate-$TARGET.tar.gz"
+          tar -czf "dist/$archive" -C "target/$TARGET/release" gate
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$archive" > "$archive.sha256")
+          else
+            (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
+          fi
+          cat "dist/$archive.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # History and tags, to find the previous release's tag
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-*
+          merge-multiple: true
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=(--verify-tag --title "gate $VERSION" --generate-notes)
+          # The notes list what was merged since the previous version tag
+          previous="$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)"
+          if [ -n "$previous" ]; then
+            args+=(--notes-start-tag "$previous")
+          fi
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" dist/*
