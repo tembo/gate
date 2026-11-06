@@ -714,33 +714,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "futures",
- "http",
- "oxc",
- "oxc_sourcemap",
- "regex",
- "reqwest",
- "rmcp",
- "rquickjs",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "sse-stream",
- "tempfile",
- "tokio",
- "tokio-util",
- "url",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2598,6 +2571,33 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tembo-gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "http",
+ "oxc",
+ "oxc_sourcemap",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "rquickjs",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sse-stream",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "url",
 ]
 
 [[package]]

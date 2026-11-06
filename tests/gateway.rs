@@ -34,7 +34,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const GATE: &str = env!("CARGO_BIN_EXE_gate");
+const GATE: &str = env!("CARGO_BIN_EXE_tembo-gate");
 
 struct Gateway {
     client: RunningService<RoleClient, ()>,
@@ -1361,6 +1361,87 @@ async fn keeps_runtime_error_messages_and_other_sources_intact() {
         .await;
     assert!(error.contains("at <eval> (<input>:1:11)"), "{error}");
     assert!(error.contains("at <anonymous> (script.ts:1:1)"), "{error}");
+}
+
+#[tokio::test]
+async fn preserves_exception_names_and_hides_the_wrapper_frame() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    for (code, prefix) in [
+        (
+            "throw new TypeError('wrong type');",
+            "TypeError: wrong type",
+        ),
+        ("missingVariable;", "ReferenceError:"),
+        ("throw new RangeError('too far');", "RangeError: too far"),
+        (
+            "class MyError extends Error { name = 'MyError'; } throw new MyError('custom');",
+            "MyError: custom",
+        ),
+        (
+            "const e = new Error('fallback'); e.name = 42; throw e;",
+            "Error: fallback",
+        ),
+        (
+            "const e = new Error('getter'); Object.defineProperty(e, 'name', { get() { throw 'bad getter'; } }); throw e;",
+            "Error: getter",
+        ),
+    ] {
+        let error = gateway.code_error(code).await;
+        assert!(error.starts_with(prefix), "{code}: {error}");
+        assert!(error.contains("script.ts:1:"), "{error}");
+        assert!(!error.contains("at <eval> (gate-script.js:"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn describes_non_error_throws_without_engine_internals() {
+    let gateway = Gateway::start(json!({}), &[]).await;
+    for (code, expected) in [
+        ("throw 'x';", "Thrown: \"x\""),
+        ("throw 42;", "Thrown: 42"),
+        ("throw undefined;", "Thrown: undefined"),
+        ("throw 123n;", "Thrown: 123n"),
+        ("throw Symbol('reason');", "Thrown: Symbol(reason)"),
+        (
+            "throw { reason: 'bad', retry: false };",
+            "Thrown: {\"reason\": \"bad\", \"retry\": false}",
+        ),
+        ("throw [1, , 'x'];", "Thrown: [1, [Empty], \"x\"]"),
+        (
+            "const a = { reason: 'cycle' }; a.self = a; throw a;",
+            "Thrown: {\"reason\": \"cycle\", \"self\": [Circular]}",
+        ),
+        (
+            "throw { get secret() { throw 'getter ran'; }, toJSON() { throw 'toJSON ran'; } };",
+            "Thrown: {\"secret\": [Getter], \"toJSON\": [Function]}",
+        ),
+        (
+            "const p = Proxy.revocable({}, {}); p.revoke(); throw p.proxy;",
+            "Thrown: [Uninspectable object]",
+        ),
+        (
+            "JSON.stringify = () => 'changed'; Object.keys = () => []; throw { reason: 'original' };",
+            "Thrown: {\"reason\": \"original\"}",
+        ),
+    ] {
+        let error = gateway.code_error(code).await;
+        assert_eq!(error, expected, "{code}");
+    }
+    let error = gateway.code_error("throw null;").await;
+    assert!(error.starts_with("Thrown: null"), "{error}");
+    let error = gateway.code_error("throw 'x'.repeat(100000);").await;
+    assert!(
+        error.len() < 1024 && error.contains('…'),
+        "{} bytes",
+        error.len()
+    );
+    let error = gateway
+        .code_error("throw Array(100).fill('x'.repeat(256));")
+        .await;
+    assert!(
+        error.len() < 4096 && error.ends_with("… [truncated]"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

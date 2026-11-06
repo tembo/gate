@@ -19,11 +19,12 @@ pub struct CompiledScript {
     pub code: String,
     map: oxc_sourcemap::SourceMap,
     source_lines: u32,
+    wrapper_frame: String,
 }
 
 impl CompiledScript {
-    /// Rewrite only frames belonging to this compilation, never error messages or
-    /// locations from the runtime, dynamic eval, or the generated async wrapper.
+    /// Map this compilation's script frames and omit its outer wrapper frame.
+    /// Preserve error messages and locations from runtime helpers or dynamic eval.
     pub fn map_stack(&self, stack: &str) -> String {
         static FRAME: LazyLock<regex::Regex> = LazyLock::new(|| {
             regex::Regex::new(
@@ -32,8 +33,14 @@ impl CompiledScript {
             .expect("valid stack frame pattern")
         });
         let lookup = self.map.generate_lookup_table();
+        // Only the outer invocation of our generated async function has this
+        // exact frame. User functions and dynamic eval frames remain visible.
+        let stack: String = stack
+            .split_inclusive('\n')
+            .filter(|line| line.trim() != self.wrapper_frame)
+            .collect();
         FRAME
-            .replace_all(stack, |frame: &regex::Captures<'_>| {
+            .replace_all(&stack, |frame: &regex::Captures<'_>| {
                 let location = frame[2]
                     .parse::<u32>()
                     .ok()
@@ -117,7 +124,12 @@ pub fn compile(code: &str) -> Result<CompiledScript, String> {
             ..Default::default()
         })
         .build(&program);
+    let wrapper_frame = format!(
+        "at <eval> ({GENERATED_FILENAME}:{}:1)",
+        output.code.lines().count()
+    );
     Ok(CompiledScript {
+        wrapper_frame,
         code: output.code,
         map: output.map.expect("source maps are enabled"),
         source_lines: code.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1,
