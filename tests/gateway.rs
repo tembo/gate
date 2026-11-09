@@ -1912,11 +1912,14 @@ async fn hook_values_are_not_inherited_under_other_names() {
     let output = dir.path().join("env");
     let config = json!({
         "hookEnv": ["GATE_TEST_HOOK", "GATE_TEST_EMPTY_HOOK"],
+        // A variable a hook only references isn't a secret, so its value can still be
+        // inherited under another name
+        "accessPolicies": {"p": {"http": {"url": "${GATE_TEST_POLICY_URL}"}}},
         "mcpServers": {"probe": {
             "command": "/bin/sh",
             "args": [
                 "-c",
-                r#"printf '%s|%s|%s|%s' "$GATE_TEST_KEEP" "$GATE_TEST_ALIAS" "$GATE_TEST_EXPLICIT" "${GATE_TEST_EMPTY+set}" > "$1"; exit 1"#,
+                r#"printf '%s|%s|%s|%s|%s' "$GATE_TEST_KEEP" "$GATE_TEST_ALIAS" "$GATE_TEST_EXPLICIT" "${GATE_TEST_EMPTY+set}" "$GATE_TEST_URL" > "$1"; exit 1"#,
                 "environment-test",
                 output,
             ],
@@ -1931,6 +1934,8 @@ async fn hook_values_are_not_inherited_under_other_names() {
             ("GATE_TEST_ALIAS", "hook-secret"),
             ("GATE_TEST_EMPTY_HOOK", ""),
             ("GATE_TEST_EMPTY", ""),
+            ("GATE_TEST_POLICY_URL", "http://127.0.0.1:1/policy"),
+            ("GATE_TEST_URL", "http://127.0.0.1:1/policy"),
         ],
         &[],
         Stdio::null(),
@@ -1940,7 +1945,7 @@ async fn hook_values_are_not_inherited_under_other_names() {
     // The alias is dropped, a value set explicitly is kept, and empty hook values match nothing
     assert_eq!(
         std::fs::read_to_string(output).unwrap(),
-        "parent||hook-secret|set"
+        "parent||hook-secret|set|http://127.0.0.1:1/policy"
     );
 }
 

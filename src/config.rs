@@ -91,6 +91,9 @@ impl Default for InheritEnv {
 pub struct Environment {
     inherit: InheritEnv,
     pub(crate) hook_env: BTreeSet<String>,
+    /// The names listed in `hookEnv`, whose values aren't inherited under any name.
+    /// Variables hooks merely reference, like a URL, aren't included
+    secret_env: BTreeSet<String>,
 }
 
 impl Environment {
@@ -100,14 +103,14 @@ impl Environment {
         explicit: &BTreeMap<String, String>,
     ) {
         command.env_clear();
-        // A hook variable's value stays with the hooks under any name, so a copy of a
-        // token in another variable isn't passed on either
+        // A `hookEnv` variable's value stays with the hooks under any name, so a copy of
+        // a token in another variable isn't passed on either
         let hook_values: Vec<_> = env::vars_os()
             .filter(|(name, value)| {
                 !value.is_empty()
                     && name
                         .to_str()
-                        .is_some_and(|name| self.hook_env.contains(name))
+                        .is_some_and(|name| self.secret_env.contains(name))
             })
             .map(|(_, value)| value)
             .collect();
@@ -248,7 +251,8 @@ impl Config {
         validate_environment_names(&raw.hook_env)?;
         validate_inheritance(&raw.inherit_env)?;
         let raw_inheritance = raw.inherit_env;
-        let mut hook_env = raw.hook_env;
+        let secret_env = raw.hook_env;
+        let mut hook_env = secret_env.clone();
         let mut access_policies = BTreeMap::new();
         for (name, hook) in raw.access_policies {
             if name.is_empty() {
@@ -294,7 +298,7 @@ impl Config {
                         credentials.provider
                     );
                 }
-                let server = Server::from_raw(raw, &env, &raw_inheritance, &hook_env)
+                let server = Server::from_raw(raw, &env, &raw_inheritance, &hook_env, &secret_env)
                     .with_context(|| format!("invalid server `{name}`"))?;
                 Ok((name, server))
             })
@@ -315,6 +319,7 @@ impl Server {
         env: &impl Fn(&str) -> Option<String>,
         inherited: &InheritEnv,
         hook_env: &BTreeSet<String>,
+        secret_env: &BTreeSet<String>,
     ) -> Result<Self> {
         if let Some(inherit) = &raw.inherit_env {
             validate_inheritance(inherit)?;
@@ -366,6 +371,7 @@ impl Server {
                 let environment = Environment {
                     inherit: raw.inherit_env.unwrap_or_else(|| inherited.clone()),
                     hook_env: hook_env.clone(),
+                    secret_env: secret_env.clone(),
                 };
                 Transport::Stdio {
                     command,
