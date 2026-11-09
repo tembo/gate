@@ -1906,6 +1906,35 @@ async fn controls_downstream_environments() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn servers_cannot_read_gates_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("environ");
+    let config = json!({
+        "hookEnv": ["GATE_TEST_HOOK"],
+        "mcpServers": {"probe": {
+            "command": "/bin/sh",
+            "args": [
+                "-c",
+                r#"cat "/proc/$PPID/comm" > "$1"; cat "/proc/$PPID/environ" >> "$1"; exit 1"#,
+                "environment-test",
+                output,
+            ],
+        }},
+    });
+    let (gateway, _) = Gateway::spawn_config(
+        config,
+        &[("GATE_TEST_HOOK", "hook-secret")],
+        &[],
+        Stdio::null(),
+    )
+    .await;
+    gateway.wait_for_status("probe", "failed").await;
+    // The server's parent is gate, but gate's environment can't be read
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "tembo-gate\n");
+}
+
 struct PolicyServer {
     url: String,
     answer: Arc<std::sync::Mutex<(StatusCode, String)>>,

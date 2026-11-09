@@ -2583,6 +2583,7 @@ dependencies = [
  "clap",
  "futures",
  "http",
+ "libc",
  "oxc",
  "oxc_sourcemap",
  "regex",

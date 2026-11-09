@@ -367,11 +367,27 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some(code::WORKER_FLAG) {
         return code::worker::main();
     }
+    hide_environment();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(serve())
 }
+
+/// Keeps servers, which run as the same user, from reading hook tokens from gate's
+/// environment in `/proc`. A non-dumpable process's `/proc` files belong to root, and
+/// children are dumpable again once they `exec`
+#[cfg(target_os = "linux")]
+fn hide_environment() {
+    // SAFETY: PR_SET_DUMPABLE takes an integer argument and touches no memory
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        eprintln!("[gate] can't hide gate's environment from servers: {error}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hide_environment() {}
 
 async fn serve() -> anyhow::Result<()> {
     let args = Args::parse();
