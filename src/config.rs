@@ -100,10 +100,22 @@ impl Environment {
         explicit: &BTreeMap<String, String>,
     ) {
         command.env_clear();
-        command.envs(env::vars_os().filter(|(name, _)| {
+        // A hook variable's value stays with the hooks under any name, so a copy of a
+        // token in another variable isn't passed on either
+        let hook_values: Vec<_> = env::vars_os()
+            .filter(|(name, value)| {
+                !value.is_empty()
+                    && name
+                        .to_str()
+                        .is_some_and(|name| self.hook_env.contains(name))
+            })
+            .map(|(_, value)| value)
+            .collect();
+        command.envs(env::vars_os().filter(|(name, value)| {
             if name
                 .to_str()
                 .is_some_and(|name| self.hook_env.contains(name))
+                || hook_values.contains(value)
             {
                 return false;
             }

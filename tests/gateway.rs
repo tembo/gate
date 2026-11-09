@@ -1906,6 +1906,44 @@ async fn controls_downstream_environments() {
     }
 }
 
+#[tokio::test]
+async fn hook_values_are_not_inherited_under_other_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("env");
+    let config = json!({
+        "hookEnv": ["GATE_TEST_HOOK", "GATE_TEST_EMPTY_HOOK"],
+        "mcpServers": {"probe": {
+            "command": "/bin/sh",
+            "args": [
+                "-c",
+                r#"printf '%s|%s|%s|%s' "$GATE_TEST_KEEP" "$GATE_TEST_ALIAS" "$GATE_TEST_EXPLICIT" "${GATE_TEST_EMPTY+set}" > "$1"; exit 1"#,
+                "environment-test",
+                output,
+            ],
+            "env": {"GATE_TEST_EXPLICIT": "hook-secret"},
+        }},
+    });
+    let (gateway, _) = Gateway::spawn_config(
+        config,
+        &[
+            ("GATE_TEST_KEEP", "parent"),
+            ("GATE_TEST_HOOK", "hook-secret"),
+            ("GATE_TEST_ALIAS", "hook-secret"),
+            ("GATE_TEST_EMPTY_HOOK", ""),
+            ("GATE_TEST_EMPTY", ""),
+        ],
+        &[],
+        Stdio::null(),
+    )
+    .await;
+    gateway.wait_for_status("probe", "failed").await;
+    // The alias is dropped, a value set explicitly is kept, and empty hook values match nothing
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        "parent||hook-secret|set"
+    );
+}
+
 struct PolicyServer {
     url: String,
     answer: Arc<std::sync::Mutex<(StatusCode, String)>>,
