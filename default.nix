@@ -5,6 +5,8 @@
 {
   lib,
   rustPlatform,
+  pkg-config,
+  aws-lc,
 }: let
   cargoToml = lib.importTOML ./Cargo.toml;
   # The executable is named after the package, unless Cargo.toml names it with [[bin]]
@@ -24,6 +26,11 @@ in
     };
 
     cargoLock.lockFile = ./Cargo.lock;
+
+    # nixpkgs' cargo setup hook sets AWS_LC_SYS_USE_SYSTEM=1, so aws-lc-sys links
+    # nixpkgs' AWS-LC instead of building its own
+    nativeBuildInputs = [pkg-config];
+    buildInputs = [aws-lc];
 
     # The tests start servers and child processes, and live in tests/, which isn't part of
     # src. CI runs them on every pull request.
