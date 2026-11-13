@@ -316,7 +316,7 @@ pub fn validate_transport(transport: &Transport, binding: Option<&Binding>) -> R
             env,
             std::iter::once(command).chain(args).collect::<Vec<_>>(),
         ),
-        Transport::Http { url, headers } => {
+        Transport::Http { url, headers, .. } => {
             if binding.is_some_and(|b| b.merge_env) {
                 bail!("mergeEnv is only valid for stdio servers");
             }

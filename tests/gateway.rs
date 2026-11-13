@@ -516,6 +516,68 @@ async fn discovers_http_tools_with_headers() {
     assert_eq!(servers[1]["toolCount"], 8);
 }
 
+/// A forward proxy, as tailscaled's userspace HTTP proxy is. Records each request's URL.
+async fn serve_forward_proxy() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let router = axum::Router::new().fallback({
+        let forwarded = forwarded.clone();
+        move |request: Request| async move {
+            let url = request.uri().to_string();
+            forwarded.lock().unwrap().push(url.clone());
+            let (parts, body) = request.into_parts();
+            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            let upstream = client
+                .request(parts.method, &url)
+                .headers(parts.headers)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            let mut response = Response::builder().status(upstream.status());
+            for (name, value) in upstream.headers() {
+                response = response.header(name, value);
+            }
+            // Streams, so SSE responses pass through as they arrive
+            response
+                .body(axum::body::Body::from_stream(upstream.bytes_stream()))
+                .unwrap()
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    (url, forwarded)
+}
+
+#[tokio::test]
+async fn http_servers_can_go_through_a_proxy() {
+    let proxied = serve_echo().await.url;
+    let direct = serve_echo().await.url;
+    let (proxy, forwarded) = serve_forward_proxy().await;
+    let mut through_proxy = echo(&proxied);
+    through_proxy["proxy"] = json!(proxy);
+    let gateway = Gateway::start(
+        json!({ "proxied": through_proxy, "direct": echo(&direct) }),
+        &[TOKEN],
+    )
+    .await;
+    gateway.wait_for_status("proxied", "ready").await;
+    gateway.wait_for_status("direct", "ready").await;
+
+    let (output, is_error) = gateway
+        .call(
+            "call_mcp_tool",
+            json!({ "serverId": "proxied", "toolName": "echo", "arguments": {} }),
+        )
+        .await;
+    assert!(!is_error, "{output}");
+    // Every request to the proxied server, and only those, went through the proxy
+    let forwarded = forwarded.lock().unwrap().clone();
+    assert!(!forwarded.is_empty());
+    assert!(forwarded.iter().all(|url| *url == proxied), "{forwarded:?}");
+}
+
 #[tokio::test]
 async fn connection_errors_hide_url_secrets() {
     // Nothing listens on port 1, so connecting fails with a transport error
