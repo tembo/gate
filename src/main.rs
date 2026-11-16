@@ -4,6 +4,7 @@ mod config;
 mod credential_http;
 mod credentials;
 mod hooks;
+mod pre_connect;
 mod redaction;
 mod registry;
 mod search;

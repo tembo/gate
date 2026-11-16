@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    os::fd::AsFd,
     process::Stdio,
     time::Duration,
 };
@@ -66,6 +67,19 @@ enum HookTransport {
 }
 
 impl RawHook {
+    /// Resolves a hook that must be a command, such as a pre-connect step
+    pub fn resolve_command(
+        self,
+        env: &impl Fn(&str) -> Option<String>,
+        hook_env: &mut BTreeSet<String>,
+        default_timeout: u64,
+    ) -> Result<Hook> {
+        if self.http.is_some() {
+            bail!("must be a command, not http");
+        }
+        self.resolve_with_timeout(env, hook_env, default_timeout)
+    }
+
     pub fn resolve(
         self,
         env: &impl Fn(&str) -> Option<String>,
@@ -175,6 +189,55 @@ impl std::fmt::Display for HookError {
 }
 
 impl Hook {
+    /// Runs a command hook for its exit status alone, with no request or response. Output
+    /// never reaches gate's stdout, which carries MCP, and isn't waited for: a process the
+    /// command leaves running can't hold the hook open.
+    pub async fn run(&self, ct: &CancellationToken) -> Result<(), HookError> {
+        let HookTransport::Command {
+            command,
+            args,
+            env,
+            stderr,
+        } = &self.transport
+        else {
+            return Err(HookError::Failure("not a command"));
+        };
+        let output = || match stderr {
+            HookStderr::Drop => Stdio::null(),
+            HookStderr::Forward => std::io::stderr()
+                .as_fd()
+                .try_clone_to_owned()
+                .map_or_else(|_| Stdio::null(), Stdio::from),
+        };
+        let mut command = Command::new(command);
+        command
+            .args(args)
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(output())
+            .stderr(output())
+            .kill_on_drop(true);
+        let mut child = {
+            let _lock = crate::spawn::lock();
+            command.spawn().map_err(|_| "could not start command")?
+        };
+        let outcome = tokio::select! {
+            biased;
+            () = ct.cancelled() => Err(HookError::Failure("cancelled")),
+            result = tokio::time::timeout(self.timeout, child.wait()) => match result {
+                Err(_) => Err(HookError::Failure("timed out")),
+                Ok(Err(_)) => Err(HookError::Failure("could not wait for command")),
+                Ok(Ok(status)) if status.success() => Ok(()),
+                Ok(Ok(_)) => Err(HookError::Failure("command failed")),
+            },
+        };
+        if outcome.is_err() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        outcome
+    }
+
     pub async fn request(
         &self,
         name: &str,
@@ -328,6 +391,59 @@ mod tests {
             .unwrap()
             .resolve(&|_| None, &mut BTreeSet::new())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_waits_for_the_exit_status_alone() {
+        let ct = CancellationToken::new();
+        let run = |script: &str, extra: Value| {
+            let mut config = json!({"command": "/bin/sh", "args": ["-c", script]});
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            hook(config)
+        };
+        assert_eq!(
+            run("echo progress; exit 0", json!({})).run(&ct).await,
+            Ok(())
+        );
+        assert_eq!(
+            run("exit 3", json!({})).run(&ct).await,
+            Err(HookError::Failure("command failed"))
+        );
+
+        // A daemon the command starts keeps its output open, which mustn't hold the hook,
+        // and outlives it
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let started = std::time::Instant::now();
+        hook(json!({"command": "/bin/sh", "args": ["-c", "sleep 30 & echo $! > \"$1\"", "test", pid], "stderr": "forward"}))
+            .run(&ct)
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid).unwrap();
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(alive());
+        std::process::Command::new("kill")
+            .arg(pid.trim())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            run("exec sleep 30", json!({"timeoutSeconds": 1}))
+                .run(&ct)
+                .await,
+            Err(HookError::Failure("timed out"))
+        );
     }
 
     #[tokio::test]

@@ -480,6 +480,7 @@ mod tests {
             gateway: Default::default(),
             access_policies: Default::default(),
             credential_providers: Default::default(),
+            pre_connect: Default::default(),
             servers: Default::default(),
         };
         let registry = Registry::start(
