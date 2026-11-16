@@ -579,6 +579,48 @@ async fn http_servers_can_go_through_a_proxy() {
 }
 
 #[tokio::test]
+async fn pre_connect_steps_run_before_every_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runs, down) = (dir.path().join("runs"), dir.path().join("down"));
+    let count = || std::fs::read_to_string(&runs).unwrap().lines().count();
+    std::fs::write(&down, "").unwrap();
+    let url = serve_echo().await.url;
+    let mut behind = echo(&url);
+    behind["preConnect"] = json!("net");
+    let (gateway, _) = Gateway::spawn_config(
+        json!({
+            "preConnect": { "net": {
+                "command": "/bin/sh",
+                "args": ["-c", "echo run >> \"$1\"; test ! -e \"$2\"", "net", runs, down],
+            } },
+            "mcpServers": { "behind": behind, "direct": echo(&url) },
+        }),
+        &[TOKEN],
+        &[],
+        Stdio::inherit(),
+    )
+    .await;
+
+    // A failing step fails only its server's attempts, all three of them
+    let failed = gateway.wait_for_status("behind", "failed").await;
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("pre-connect step `net` failed"), "{error}");
+    gateway.wait_for_status("direct", "ready").await;
+    assert_eq!(count(), 3);
+
+    // Once the step succeeds, the next attempt runs it again and connects
+    std::fs::remove_file(&down).unwrap();
+    let (output, is_error) = gateway
+        .call(
+            "call_mcp_tool",
+            json!({ "serverId": "behind", "toolName": "echo", "arguments": {} }),
+        )
+        .await;
+    assert!(!is_error, "{output}");
+    assert_eq!(count(), 4);
+}
+
+#[tokio::test]
 async fn connection_errors_hide_url_secrets() {
     // Nothing listens on port 1, so connecting fails with a transport error
     let gateway = Gateway::start(

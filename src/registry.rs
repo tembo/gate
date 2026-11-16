@@ -228,6 +228,10 @@ impl Registry {
                 let (events, credential_events) = mpsc::unbounded_channel();
                 let supervisor = Supervisor {
                     config: config.clone(),
+                    pre_connect: server
+                        .pre_connect
+                        .as_ref()
+                        .map(|step| config.pre_connect[step].clone()),
                     binding: server.credentials.clone(),
                     events,
                     rejected: VecDeque::new(),
@@ -514,6 +518,7 @@ type FirstAttempt = (OwnedSemaphorePermit, AttemptSender);
 /// Keeps a server connected, and its status up to date, for as long as the gateway runs
 struct Supervisor {
     config: Arc<Config>,
+    pre_connect: Option<Arc<crate::pre_connect::PreConnect>>,
     binding: Option<crate::credentials::Binding>,
     events: mpsc::UnboundedSender<CredentialEvent>,
     rejected: VecDeque<[u8; 32]>,
@@ -781,6 +786,9 @@ impl Supervisor {
     async fn connect(&mut self) -> Result<(Client, Arc<Connection>), String> {
         use crate::credentials::Outcome;
         self.denied = false;
+        if let Some(step) = &self.pre_connect {
+            step.run().await.map_err(|error| error.to_string())?;
+        }
         let lease = if let Some(binding) = &self.binding {
             let lease = match self.next_lease.take() {
                 Some(lease) if !lease.expired() => lease,
@@ -1151,11 +1159,13 @@ mod tests {
                 gateway: Default::default(),
                 access_policies: BTreeMap::new(),
                 credential_providers: BTreeMap::new(),
+                pre_connect: BTreeMap::new(),
                 servers: BTreeMap::from([(
                     "s".into(),
                     crate::config::Server {
                         access: None,
                         credentials: None,
+                        pre_connect: None,
                         description: None,
                         transport: Transport::Http {
                             url: "http://localhost".into(),
@@ -1276,6 +1286,7 @@ mod tests {
             description: None,
             access: None,
             credentials: None,
+            pre_connect: None,
             transport: Transport::Stdio {
                 command: "sh".into(),
                 args: vec!["-c".into(), "echo boom >&2; exit 1".into()],
@@ -1287,6 +1298,7 @@ mod tests {
             gateway: Default::default(),
             access_policies: BTreeMap::new(),
             credential_providers: BTreeMap::new(),
+            pre_connect: BTreeMap::new(),
             servers: BTreeMap::from([("s".to_owned(), server)]),
         };
         let delays = [Duration::from_millis(10); 2];

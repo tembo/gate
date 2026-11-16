@@ -19,6 +19,7 @@ pub struct Config {
     pub servers: BTreeMap<ServerId, Server>,
     pub credential_providers: BTreeMap<String, crate::credentials::Provider>,
     pub access_policies: BTreeMap<String, crate::hooks::Hook>,
+    pub pre_connect: BTreeMap<String, std::sync::Arc<crate::pre_connect::PreConnect>>,
 }
 
 /// Agent-facing metadata; these strings are literal and never expand secrets.
@@ -50,6 +51,8 @@ pub struct Server {
     pub description: Option<String>,
     pub access: Option<Access>,
     pub credentials: Option<crate::credentials::Binding>,
+    /// The pre-connect step to run before every connection attempt
+    pub pre_connect: Option<String>,
     pub transport: Transport,
 }
 
@@ -173,6 +176,8 @@ struct RawConfig {
     #[serde(default)]
     credential_providers: BTreeMap<String, crate::credentials::RawProvider>,
     #[serde(default)]
+    pre_connect: BTreeMap<String, crate::hooks::RawHook>,
+    #[serde(default)]
     hook_env: BTreeSet<String>,
     #[serde(default)]
     inherit_env: InheritEnv,
@@ -219,6 +224,8 @@ fn unique_servers<'de, D: Deserializer<'de>>(
 struct RawServer {
     credentials: Option<crate::credentials::Binding>,
     access: Option<Access>,
+    #[serde(rename = "preConnect")]
+    pre_connect: Option<String>,
     #[serde(rename = "inheritEnv")]
     inherit_env: Option<InheritEnv>,
     #[serde(rename = "type")]
@@ -278,6 +285,20 @@ impl Config {
                     .with_context(|| format!("invalid credential provider `{name}`"))?,
             );
         }
+        let mut pre_connect = BTreeMap::new();
+        for (name, hook) in raw.pre_connect {
+            if name.is_empty() {
+                bail!("pre-connect step names must not be empty");
+            }
+            // A first run may install or start things, so the default timeout is generous
+            let hook = hook
+                .resolve_command(&env, &mut hook_env, 120)
+                .with_context(|| format!("invalid pre-connect step `{name}`"))?;
+            pre_connect.insert(
+                name.clone(),
+                std::sync::Arc::new(crate::pre_connect::PreConnect::new(name, hook)),
+            );
+        }
         let servers = raw
             .mcp_servers
             .into_iter()
@@ -292,6 +313,11 @@ impl Config {
                         "server `{name}` references unknown access policy `{}`",
                         access.policy
                     );
+                }
+                if let Some(step) = &raw.pre_connect
+                    && !pre_connect.contains_key(step)
+                {
+                    bail!("server `{name}` references unknown pre-connect step `{step}`");
                 }
                 if let Some(credentials) = &raw.credentials
                     && !credential_providers.contains_key(&credentials.provider)
@@ -312,6 +338,7 @@ impl Config {
             servers,
             access_policies,
             credential_providers,
+            pre_connect,
         })
     }
 }
@@ -420,6 +447,7 @@ impl Server {
             credentials: raw.credentials,
             description: raw.description,
             access: raw.access,
+            pre_connect: raw.pre_connect,
             transport,
         })
     }
@@ -520,6 +548,49 @@ mod tests {
     }
 
     #[test]
+    fn pre_connect_steps_are_commands_that_servers_reference() {
+        let config = parse(
+            &serde_json::json!({
+                "preConnect": { "net": { "command": "join", "env": { "KEY": "${TOKEN}" } } },
+                "mcpServers": { "s": { "url": "https://example.com", "preConnect": "net" } },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(config.servers["s"].pre_connect.as_deref(), Some("net"));
+        assert!(config.pre_connect.contains_key("net"));
+
+        let step =
+            serde_json::json!({ "net": { "command": "join", "env": { "KEY": "${TOKEN}" } } });
+        for (config, message) in [
+            (
+                serde_json::json!({
+                    "preConnect": { "net": { "http": { "url": "https://example.com" } } },
+                    "mcpServers": {},
+                }),
+                "must be a command",
+            ),
+            (
+                serde_json::json!({
+                    "mcpServers": { "s": { "url": "https://example.com", "preConnect": "missing" } },
+                }),
+                "unknown pre-connect step `missing`",
+            ),
+            // Like other hooks', a step's variables are reserved for hooks
+            (
+                serde_json::json!({
+                    "preConnect": step,
+                    "mcpServers": { "s": { "command": "run", "env": { "T": "${TOKEN}" } } },
+                }),
+                "reserved for hooks",
+            ),
+        ] {
+            let error = format!("{:#}", parse(&config.to_string()).unwrap_err());
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
     fn validates_gateway_metadata() {
         for gateway in [
             serde_json::json!({"name":" "}),
@@ -566,6 +637,7 @@ mod tests {
                 description: Some("Runs".into()),
                 access: None,
                 credentials: None,
+                pre_connect: None,
                 transport: Transport::Stdio {
                     command: "run".into(),
                     args: vec![],

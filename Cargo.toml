@@ -1,6 +1,6 @@
 [package]
 name = "tembo-gate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Oxc 0.120 needs 1.92
 rust-version = "1.92"
