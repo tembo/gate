@@ -71,6 +71,8 @@ pub enum Transport {
     Http {
         url: String,
         headers: BTreeMap<String, String>,
+        /// Forward proxy for every request to the server, for servers only reachable through one
+        proxy: Option<String>,
     },
 }
 
@@ -226,6 +228,7 @@ struct RawServer {
     env: Option<BTreeMap<String, String>>,
     url: Option<String>,
     headers: Option<BTreeMap<String, String>>,
+    proxy: Option<String>,
     description: Option<String>,
 }
 
@@ -352,6 +355,7 @@ impl Server {
             Kind::Stdio => {
                 reject(kind, "url", &raw.url)?;
                 reject(kind, "headers", &raw.headers)?;
+                reject(kind, "proxy", &raw.proxy)?;
                 let command = expand("command", &raw.command.context("needs `command`")?)?;
                 if command.is_empty() {
                     bail!("`command` must not be empty");
@@ -392,7 +396,22 @@ impl Server {
                     bail!("`url` must be http or https");
                 }
                 let headers = expand_map("headers", raw.headers)?;
-                Transport::Http { url, headers }
+                let proxy = raw
+                    .proxy
+                    .map(|proxy| {
+                        let proxy = expand("proxy", &proxy)?;
+                        let parsed = Url::parse(&proxy).context("invalid `proxy`")?;
+                        if !matches!(parsed.scheme(), "http" | "https") {
+                            bail!("`proxy` must be http or https");
+                        }
+                        Ok(proxy)
+                    })
+                    .transpose()?;
+                Transport::Http {
+                    url,
+                    headers,
+                    proxy,
+                }
             }
         };
 
@@ -670,8 +689,39 @@ mod tests {
             Transport::Http {
                 url: "https://example.com/secret".into(),
                 headers: BTreeMap::from([("Authorization".into(), "Bearer secret".into())]),
+                proxy: None,
             }
         );
+    }
+
+    #[test]
+    fn http_servers_take_a_proxy() {
+        let server = parse_one(serde_json::json!({
+            "url": "https://tools.internal/mcp",
+            "proxy": "${PROXY:-http://localhost:1056}",
+        }))
+        .unwrap();
+        assert!(matches!(
+            server.transport,
+            Transport::Http { proxy: Some(ref proxy), .. } if proxy == "http://localhost:1056"
+        ));
+        for (server, message) in [
+            (
+                serde_json::json!({ "url": "https://example.com", "proxy": "socks5://localhost:1055" }),
+                "`proxy` must be http or https",
+            ),
+            (
+                serde_json::json!({ "url": "https://example.com", "proxy": "not a url" }),
+                "invalid `proxy`",
+            ),
+            (
+                serde_json::json!({ "command": "run", "proxy": "http://localhost:1056" }),
+                "`proxy` is not valid for a `stdio` server",
+            ),
+        ] {
+            let error = error(server);
+            assert!(error.contains(message), "{error}");
+        }
     }
 
     #[test]

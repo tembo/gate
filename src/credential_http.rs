@@ -59,11 +59,13 @@ pub struct HttpClient {
     pub auth: Arc<AuthResponses>,
 }
 impl HttpClient {
-    pub fn new(auth: Arc<AuthResponses>) -> Result<Self, reqwest::Error> {
+    pub fn new(auth: Arc<AuthResponses>, proxy: Option<&str>) -> Result<Self, reqwest::Error> {
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+        }
         Ok(Self {
-            inner: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            inner: builder.build()?,
             auth,
         })
     }
@@ -340,7 +342,7 @@ mod tests {
             .await
             .unwrap()
         });
-        let client = HttpClient::new(Arc::new(AuthResponses::default())).unwrap();
+        let client = HttpClient::new(Arc::new(AuthResponses::default()), None).unwrap();
         for id in 0..2 {
             let message = ClientJsonRpcMessage::request(
                 ClientRequest::PingRequest(Default::default()),

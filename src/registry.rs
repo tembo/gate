@@ -976,7 +976,11 @@ async fn connect(
                 }
             }
         }
-        Transport::Http { url, headers } => {
+        Transport::Http {
+            url,
+            headers,
+            proxy,
+        } => {
             let custom_headers = headers
                 .iter()
                 .map(|(name, value)| {
@@ -997,7 +1001,7 @@ async fn connect(
                 config
             };
             handshake(StreamableHttpClientTransport::with_client(
-                crate::credential_http::HttpClient::new(auth)?,
+                crate::credential_http::HttpClient::new(auth, proxy.as_deref())?,
                 config,
             ))
             .await
@@ -1156,6 +1160,7 @@ mod tests {
                         transport: Transport::Http {
                             url: "http://localhost".into(),
                             headers: BTreeMap::new(),
+                            proxy: None,
                         },
                     },
                 )]),
