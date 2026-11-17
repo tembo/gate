@@ -148,7 +148,10 @@ impl Gate {
             .iter()
             .filter(|(id, _)| allowed.contains(*id))
             .map(|(id, server)| {
-                let mut entry = json!({ "serverId": id, "transport": server.transport.kind() });
+                let mut entry = json!({ "serverId": id });
+                if let Some(kind) = server.kind() {
+                    entry["transport"] = json!(kind);
+                }
                 if let Some(description) = &server.description {
                     entry["description"] = description.as_str().into();
                 }

@@ -53,7 +53,16 @@ pub struct Server {
     pub credentials: Option<crate::credentials::Binding>,
     /// The pre-connect step to run before every connection attempt
     pub pre_connect: Option<String>,
-    pub transport: Transport,
+    /// How to reach the server, or why its definition is invalid. An invalid server fails on
+    /// its own instead of rejecting the whole config
+    pub transport: Result<Transport, Invalid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invalid {
+    /// The server's transport, when it's known
+    pub kind: Option<Kind>,
+    pub error: std::sync::Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -137,6 +146,15 @@ impl Environment {
                 .iter()
                 .filter(|(name, _)| !self.hook_env.contains(*name)),
         );
+    }
+}
+
+impl Server {
+    pub fn kind(&self) -> Option<Kind> {
+        match &self.transport {
+            Ok(transport) => Some(transport.kind()),
+            Err(invalid) => invalid.kind,
+        }
     }
 }
 
@@ -228,8 +246,9 @@ struct RawServer {
     pre_connect: Option<String>,
     #[serde(rename = "inheritEnv")]
     inherit_env: Option<InheritEnv>,
+    /// Read as a string, so an unsupported type only fails its server
     #[serde(rename = "type")]
-    kind: Option<Kind>,
+    kind: Option<String>,
     command: Option<String>,
     args: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
@@ -327,8 +346,7 @@ impl Config {
                         credentials.provider
                     );
                 }
-                let server = Server::from_raw(raw, &env, &raw_inheritance, &hook_env, &secret_env)
-                    .with_context(|| format!("invalid server `{name}`"))?;
+                let server = Server::from_raw(raw, &env, &raw_inheritance, &hook_env, &secret_env);
                 Ok((name, server))
             })
             .collect::<Result<_>>()?;
@@ -345,22 +363,40 @@ impl Config {
 
 impl Server {
     fn from_raw(
-        raw: RawServer,
+        mut raw: RawServer,
         env: &impl Fn(&str) -> Option<String>,
         inherited: &InheritEnv,
         hook_env: &BTreeSet<String>,
         secret_env: &BTreeSet<String>,
-    ) -> Result<Self> {
+    ) -> Self {
+        let kind = raw.kind();
+        let known = kind.as_ref().ok().copied();
+        let transport = kind
+            .and_then(|kind| Self::transport(kind, &mut raw, env, inherited, hook_env, secret_env))
+            .map_err(|error| Invalid {
+                kind: known,
+                error: format!("{error:#}").into(),
+            });
+        Self {
+            credentials: raw.credentials,
+            description: raw.description,
+            access: raw.access,
+            pre_connect: raw.pre_connect,
+            transport,
+        }
+    }
+
+    fn transport(
+        kind: Kind,
+        raw: &mut RawServer,
+        env: &impl Fn(&str) -> Option<String>,
+        inherited: &InheritEnv,
+        hook_env: &BTreeSet<String>,
+        secret_env: &BTreeSet<String>,
+    ) -> Result<Transport> {
         if let Some(inherit) = &raw.inherit_env {
             validate_inheritance(inherit)?;
         }
-        let kind = match (raw.kind, &raw.command, &raw.url) {
-            (Some(kind), _, _) => kind,
-            (None, Some(_), None) => Kind::Stdio,
-            (None, None, Some(_)) => Kind::Http,
-            (None, Some(_), Some(_)) => bail!("has both `command` and `url`"),
-            (None, None, None) => bail!("needs either `command` or `url`"),
-        };
 
         let expand = |field: &str, text: &str| {
             if text.contains("${credential:")
@@ -383,24 +419,25 @@ impl Server {
                 reject(kind, "url", &raw.url)?;
                 reject(kind, "headers", &raw.headers)?;
                 reject(kind, "proxy", &raw.proxy)?;
-                let command = expand("command", &raw.command.context("needs `command`")?)?;
+                let command = expand("command", &raw.command.take().context("needs `command`")?)?;
                 if command.is_empty() {
                     bail!("`command` must not be empty");
                 }
                 let args = raw
                     .args
+                    .take()
                     .unwrap_or_default()
                     .iter()
                     .map(|arg| expand("args", arg))
                     .collect::<Result<_>>()?;
-                let env = expand_map("env", raw.env)?;
+                let env = expand_map("env", raw.env.take())?;
                 for name in env.keys() {
                     if hook_env.contains(name) {
                         bail!("environment variable `{name}` is reserved for hooks");
                     }
                 }
                 let environment = Environment {
-                    inherit: raw.inherit_env.unwrap_or_else(|| inherited.clone()),
+                    inherit: raw.inherit_env.take().unwrap_or_else(|| inherited.clone()),
                     hook_env: hook_env.clone(),
                     secret_env: secret_env.clone(),
                 };
@@ -416,15 +453,16 @@ impl Server {
                 reject(kind, "command", &raw.command)?;
                 reject(kind, "args", &raw.args)?;
                 reject(kind, "env", &raw.env)?;
-                let url = expand("url", &raw.url.context("needs `url`")?)?;
+                let url = expand("url", &raw.url.take().context("needs `url`")?)?;
                 // The URL may contain expanded secrets, so errors don't include it
                 let parsed = Url::parse(&url).context("invalid `url`")?;
                 if !matches!(parsed.scheme(), "http" | "https") {
                     bail!("`url` must be http or https");
                 }
-                let headers = expand_map("headers", raw.headers)?;
+                let headers = expand_map("headers", raw.headers.take())?;
                 let proxy = raw
                     .proxy
+                    .take()
                     .map(|proxy| {
                         let proxy = expand("proxy", &proxy)?;
                         let parsed = Url::parse(&proxy).context("invalid `proxy`")?;
@@ -443,12 +481,22 @@ impl Server {
         };
 
         crate::credentials::validate_transport(&transport, raw.credentials.as_ref())?;
-        Ok(Self {
-            credentials: raw.credentials,
-            description: raw.description,
-            access: raw.access,
-            pre_connect: raw.pre_connect,
-            transport,
+        Ok(transport)
+    }
+}
+
+impl RawServer {
+    fn kind(&self) -> Result<Kind> {
+        Ok(match (self.kind.as_deref(), &self.command, &self.url) {
+            (Some("stdio"), _, _) => Kind::Stdio,
+            (Some("http"), _, _) => Kind::Http,
+            // rmcp has no client for the deprecated SSE transport
+            (Some("sse"), _, _) => bail!("the SSE transport isn't supported"),
+            (Some(kind), _, _) => bail!("unknown type `{kind}`"),
+            (None, Some(_), None) => Kind::Stdio,
+            (None, None, Some(_)) => Kind::Http,
+            (None, Some(_), Some(_)) => bail!("has both `command` and `url`"),
+            (None, None, None) => bail!("needs either `command` or `url`"),
         })
     }
 }
@@ -543,8 +591,27 @@ mod tests {
         Ok(parse(&text)?.servers.remove("s").unwrap())
     }
 
+    /// Why the server is invalid
     fn error(server: serde_json::Value) -> String {
-        format!("{:#}", parse_one(server).unwrap_err())
+        parse_one(server)
+            .unwrap()
+            .transport
+            .unwrap_err()
+            .error
+            .to_string()
+    }
+
+    /// Why server `s` is invalid, in a config that's otherwise valid
+    fn server_error(config: &serde_json::Value) -> String {
+        let mut config = parse(&config.to_string()).unwrap();
+        config
+            .servers
+            .remove("s")
+            .unwrap()
+            .transport
+            .unwrap_err()
+            .error
+            .to_string()
     }
 
     #[test]
@@ -576,18 +643,16 @@ mod tests {
                 }),
                 "unknown pre-connect step `missing`",
             ),
-            // Like other hooks', a step's variables are reserved for hooks
-            (
-                serde_json::json!({
-                    "preConnect": step,
-                    "mcpServers": { "s": { "command": "run", "env": { "T": "${TOKEN}" } } },
-                }),
-                "reserved for hooks",
-            ),
         ] {
             let error = format!("{:#}", parse(&config.to_string()).unwrap_err());
             assert!(error.contains(message), "{error}");
         }
+        // Like other hooks', a step's variables are reserved for hooks
+        let error = server_error(&serde_json::json!({
+            "preConnect": step,
+            "mcpServers": { "s": { "command": "run", "env": { "T": "${TOKEN}" } } },
+        }));
+        assert!(error.contains("reserved for hooks"), "{error}");
     }
 
     #[test]
@@ -607,24 +672,40 @@ mod tests {
     fn validates_credential_configuration() {
         let provider =
             serde_json::json!({"command":"run", "refreshFailure":"revoke", "drainSeconds":0});
-        for server in [
-            serde_json::json!({"command":"${credential:token}"}),
-            serde_json::json!({"command":"run","args":["${credential:token}"]}),
-            serde_json::json!({"url":"https://example.com/${credential:token}"}),
-            serde_json::json!({"command":"run","env":{"T":"${credential:token}"}}),
-            serde_json::json!({"url":"https://example.com","credentials":{"provider":"p","mergeEnv":true}}),
-            serde_json::json!({"command":"run","credentials":{"provider":"missing"}}),
+        for (server, message) in [
+            (
+                serde_json::json!({"command":"${credential:token}"}),
+                "only allowed in env and headers",
+            ),
+            (
+                serde_json::json!({"command":"run","args":["${credential:token}"]}),
+                "only allowed in env and headers",
+            ),
+            (
+                serde_json::json!({"url":"https://example.com/${credential:token}"}),
+                "only allowed in env and headers",
+            ),
+            (
+                serde_json::json!({"command":"run","env":{"T":"${credential:token}"}}),
+                "requires a provider",
+            ),
+            (
+                serde_json::json!({"url":"https://example.com","credentials":{"provider":"p","mergeEnv":true}}),
+                "only valid for stdio servers",
+            ),
         ] {
             let value =
                 serde_json::json!({"credentialProviders":{"p":provider},"mcpServers":{"s":server}});
-            assert!(parse(&value.to_string()).is_err(), "{value}");
+            let error = server_error(&value);
+            assert!(error.contains(message), "{value}: {error}");
         }
+        // An unknown provider is a mistake in the config as a whole
+        let value = serde_json::json!({"credentialProviders":{"p":provider},"mcpServers":{"s":{"command":"run","credentials":{"provider":"missing"}}}});
+        assert!(parse(&value.to_string()).is_err());
         let value = serde_json::json!({"credentialProviders":{"p":provider},"mcpServers":{"s":{"command":"run","env":{"T":"Bearer ${credential:token}"},"credentials":{"provider":"p"}}}});
         assert!(parse(&value.to_string()).is_ok());
         let value = serde_json::json!({"credentialProviders":{"p":{"command":"run","env":{"T":"${TOKEN}"}}},"mcpServers":{"s":{"command":"run","env":{"T":"${TOKEN}"}}}});
-        assert!(
-            format!("{:#}", parse(&value.to_string()).unwrap_err()).contains("reserved for hooks")
-        );
+        assert!(server_error(&value).contains("reserved for hooks"));
     }
 
     #[test]
@@ -638,12 +719,12 @@ mod tests {
                 access: None,
                 credentials: None,
                 pre_connect: None,
-                transport: Transport::Stdio {
+                transport: Ok(Transport::Stdio {
                     command: "run".into(),
                     args: vec![],
                     env: BTreeMap::new(),
                     environment: Environment::default(),
-                },
+                }),
             }
         );
     }
@@ -651,7 +732,7 @@ mod tests {
     #[test]
     fn infers_http_from_url() {
         let server = parse_one(serde_json::json!({ "url": "https://example.com/mcp" })).unwrap();
-        assert_eq!(server.transport.kind(), Kind::Http);
+        assert_eq!(server.kind(), Some(Kind::Http));
     }
 
     #[test]
@@ -698,17 +779,37 @@ mod tests {
                 error.contains(expected),
                 "{server}: `{error}` lacks `{expected}`"
             );
-            assert!(error.contains("invalid server `s`"), "{error}");
         }
     }
 
     #[test]
     fn rejects_unknown_types() {
-        // rmcp has no client for the deprecated SSE transport
-        let error = parse(r#"{ "mcpServers": { "s": { "type": "sse", "url": "http://x" } } }"#)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unknown variant `sse`"), "{error}");
+        let sse = error(serde_json::json!({ "type": "sse", "url": "http://x" }));
+        assert!(sse.contains("SSE transport isn't supported"), "{sse}");
+        let unknown = error(serde_json::json!({ "type": "ws", "url": "ws://x" }));
+        assert!(unknown.contains("unknown type `ws`"), "{unknown}");
+    }
+
+    #[test]
+    fn an_invalid_server_does_not_affect_the_others() {
+        let config = parse(
+            &serde_json::json!({
+                "mcpServers": {
+                    "unset": { "url": "${MISSING:-}" },
+                    "sse": { "type": "sse", "url": "https://example.com/sse", "description": "Old" },
+                    "ok": { "url": "https://example.com/mcp" },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(config.servers["ok"].transport.is_ok());
+        let unset = config.servers["unset"].transport.as_ref().unwrap_err();
+        assert_eq!(unset.kind, Some(Kind::Http));
+        assert!(unset.error.contains("invalid `url`"), "{}", unset.error);
+        // Its other fields still apply, like its description
+        assert_eq!(config.servers["sse"].description.as_deref(), Some("Old"));
+        assert_eq!(config.servers["sse"].kind(), None);
     }
 
     #[test]
@@ -742,7 +843,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            stdio.transport,
+            stdio.transport.unwrap(),
             Transport::Stdio {
                 command: "secret/bin".into(),
                 args: vec!["--key=secret".into()],
@@ -757,7 +858,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            http.transport,
+            http.transport.unwrap(),
             Transport::Http {
                 url: "https://example.com/secret".into(),
                 headers: BTreeMap::from([("Authorization".into(), "Bearer secret".into())]),
@@ -774,7 +875,7 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            server.transport,
+            server.transport.unwrap(),
             Transport::Http { proxy: Some(ref proxy), .. } if proxy == "http://localhost:1056"
         ));
         for (server, message) in [
@@ -815,15 +916,13 @@ mod tests {
             ];
             for server in servers {
                 let config = serde_json::json!({"hookEnv": ["TOKEN", "MISSING"], "mcpServers": {"s": server}});
-                let error = format!("{:#}", parse(&config.to_string()).unwrap_err());
+                let error = server_error(&config);
                 assert!(error.contains("reserved for hooks"), "{error}");
                 assert!(!error.contains("secret"), "{error}");
             }
         }
         let config = serde_json::json!({"hookEnv": ["TOKEN"], "mcpServers": {"s": {"command": "run", "env": {"TOKEN": "literal"}}}});
-        assert!(
-            format!("{:#}", parse(&config.to_string()).unwrap_err()).contains("reserved for hooks")
-        );
+        assert!(server_error(&config).contains("reserved for hooks"));
     }
 
     #[test]
@@ -850,7 +949,7 @@ mod tests {
             serde_json::json!({"http":{"url":"https://example.com", "headers":{"Authorization":"${TOKEN}"}}}),
         ] {
             let config = serde_json::json!({"accessPolicies":{"p":hook},"mcpServers":{"s":{"command":"run","args":["${TOKEN}"]}}});
-            let error = format!("{:#}", parse(&config.to_string()).unwrap_err());
+            let error = server_error(&config);
             assert!(error.contains("reserved for hooks"), "{error}");
             assert!(!error.contains("secret"), "{error}");
         }
@@ -863,10 +962,14 @@ mod tests {
             serde_json::json!({"hookEnv": true, "mcpServers": {}}),
             serde_json::json!({"inheritEnv": "PATH", "mcpServers": {}}),
             serde_json::json!({"inheritEnv": [""], "mcpServers": {}}),
-            serde_json::json!({"mcpServers": {"s": {"command": "run", "inheritEnv": ["BAD=NAME"]}}}),
-            serde_json::json!({"mcpServers": {"s": {"url": "https://example.com", "inheritEnv": false}}}),
         ] {
             assert!(parse(&config.to_string()).is_err(), "{config}");
+        }
+        for server in [
+            serde_json::json!({"command": "run", "inheritEnv": ["BAD=NAME"]}),
+            serde_json::json!({"url": "https://example.com", "inheritEnv": false}),
+        ] {
+            assert!(parse_one(server).unwrap().transport.is_err());
         }
         assert!(parse(r#"{"inheritEnv": false, "hookEnv": ["TOKEN"], "mcpServers": {"s": {"url": "https://example.com"}}}"#).is_ok());
     }
