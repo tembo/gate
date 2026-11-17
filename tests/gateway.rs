@@ -271,6 +271,48 @@ async fn reports_failed_servers() {
 }
 
 #[tokio::test]
+async fn invalid_servers_fail_without_taking_the_others_down() {
+    let gateway = Gateway::start(
+        json!({
+            "unset": { "url": "${MCP_URL:-}", "description": "Unset" },
+            "sse": { "type": "sse", "url": "https://example.com/sse" },
+            "inner": nested_gate(),
+        }),
+        &[],
+    )
+    .await;
+    gateway.wait_for_status("inner", "ready").await;
+
+    let servers = gateway.servers().await;
+    assert_eq!(servers[0]["serverId"], "inner");
+    assert_eq!(
+        servers[1],
+        json!({
+            "serverId": "sse",
+            "status": "failed",
+            "error": "the SSE transport isn't supported",
+        })
+    );
+    assert_eq!(servers[2]["serverId"], "unset");
+    assert_eq!(servers[2]["transport"], "http");
+    assert_eq!(servers[2]["description"], "Unset");
+    assert_eq!(servers[2]["status"], "failed");
+    let invalid = servers[2]["error"].as_str().unwrap();
+    assert!(invalid.contains("invalid `url`"), "{invalid}");
+
+    // Requests retry a failed server, and get the same reason
+    let (output, is_error) = gateway
+        .call(
+            "call_mcp_tool",
+            json!({ "serverId": "unset", "toolName": "x", "arguments": {} }),
+        )
+        .await;
+    assert!(is_error);
+    assert!(output.to_string().contains("invalid `url`"), "{output}");
+    gateway.wait_for_status("unset", "failed").await;
+}
+
+#[tokio::test]
 async fn limits_batch_size() {
     let gateway = Gateway::start(json!({}), &[]).await;
     let item = json!({ "serverId": "s", "toolName": "t" });

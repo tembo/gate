@@ -208,6 +208,28 @@ impl Registry {
             .servers
             .iter()
             .map(|(id, server)| {
+                let (retry, retries) = mpsc::unbounded_channel();
+                let transport = match &server.transport {
+                    Ok(transport) => transport,
+                    Err(invalid) => {
+                        eprintln!("[gate] server `{id}` is invalid: {}", invalid.error);
+                        let status =
+                            Arc::new(watch::Sender::new(Status::Failed(invalid.error.clone())));
+                        tokio::spawn(fail_attempts(
+                            invalid.error.clone(),
+                            status.clone(),
+                            retries,
+                        ));
+                        return (
+                            id.clone(),
+                            ServerHandle {
+                                description: server.description.clone(),
+                                status,
+                                retry,
+                            },
+                        );
+                    }
+                };
                 // Servers that get a permit now start with their first attempt in place, so
                 // requests wait for it from the start. The rest are queued.
                 let first_attempt =
@@ -224,7 +246,6 @@ impl Registry {
                     None => Status::Pending,
                 };
                 let status = Arc::new(watch::Sender::new(status));
-                let (retry, retries) = mpsc::unbounded_channel();
                 let (events, credential_events) = mpsc::unbounded_channel();
                 let supervisor = Supervisor {
                     config: config.clone(),
@@ -240,7 +261,7 @@ impl Registry {
                     denied: false,
                     call_timeout,
                     id: id.clone(),
-                    transport: server.transport.clone(),
+                    transport: transport.clone(),
                     status: status.clone(),
                     retry_delays,
                     background_permits: background_permits.clone(),
@@ -509,6 +530,18 @@ impl Registry {
             return Err(format!("unknown server `{server_id}`"));
         }
         result
+    }
+}
+
+/// Fails every attempt to connect to a server whose definition is invalid, with the reason
+async fn fail_attempts(
+    error: Arc<str>,
+    status: Arc<watch::Sender<Status>>,
+    mut retries: mpsc::UnboundedReceiver<AttemptSender>,
+) {
+    while let Some(result) = retries.recv().await {
+        result.send_replace(Some(Err(error.clone())));
+        status.send_replace(Status::Failed(error.clone()));
     }
 }
 
@@ -1167,11 +1200,11 @@ mod tests {
                         credentials: None,
                         pre_connect: None,
                         description: None,
-                        transport: Transport::Http {
+                        transport: Ok(Transport::Http {
                             url: "http://localhost".into(),
                             headers: BTreeMap::new(),
                             proxy: None,
-                        },
+                        }),
                     },
                 )]),
             })),
@@ -1287,12 +1320,12 @@ mod tests {
             access: None,
             credentials: None,
             pre_connect: None,
-            transport: Transport::Stdio {
+            transport: Ok(Transport::Stdio {
                 command: "sh".into(),
                 args: vec!["-c".into(), "echo boom >&2; exit 1".into()],
                 env: BTreeMap::new(),
                 environment: Default::default(),
-            },
+            }),
         };
         let config = Config {
             gateway: Default::default(),
