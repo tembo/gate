@@ -3163,3 +3163,77 @@ async fn plain_http_servers_reuse_tcp_connections() {
     assert_eq!(peers.lock().unwrap().len(), 1);
     task.abort();
 }
+
+/// Stateless server that, like Datadog's, rejects `initialize` for versions it doesn't
+/// support instead of answering with one it does. Sends each requested version.
+async fn strict_version_server(
+    supported: &'static [&'static str],
+) -> (String, mpsc::UnboundedReceiver<String>) {
+    let (sent, requested) = mpsc::unbounded_channel();
+    let handler = move |axum::Json(body): axum::Json<Value>| {
+        let sent = sent.clone();
+        async move {
+            let Some(id) = body.get("id").cloned() else {
+                return StatusCode::ACCEPTED.into_response();
+            };
+            let result = match body["method"].as_str().unwrap_or("") {
+                "initialize" => {
+                    let version = body["params"]["protocolVersion"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    sent.send(version.clone()).unwrap();
+                    if !supported.contains(&version.as_str()) {
+                        return axum::Json(json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-32022,
+                            "message":"unsupported protocol version",
+                            "data":{"requested":version,"supported":supported},
+                        }}))
+                        .into_response();
+                    }
+                    json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"strict","version":"1"}})
+                }
+                "tools/list" => json!({"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}),
+                _ => json!({}),
+            };
+            axum::Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+        }
+    };
+    let router = axum::Router::new().route("/mcp", axum::routing::post(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, requested)
+}
+
+#[tokio::test]
+async fn initializes_with_a_version_that_has_a_handshake_and_falls_back_on_rejection() {
+    let cases: [(&[&str], &str, &[&str]); 3] = [
+        // Datadog's list at the time it started rejecting `2026-07-28`
+        (
+            &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+            "ready",
+            &["2025-11-25"],
+        ),
+        (
+            &["2024-11-05", "2025-03-26"],
+            "ready",
+            &["2025-11-25", "2025-03-26"],
+        ),
+        // Versions from `2026-07-28` have no `initialize`, so there's nothing to fall back to
+        (&["2026-07-28"], "failed", &["2025-11-25"]),
+    ];
+    for (supported, status, expected) in cases {
+        let (url, mut requested) = strict_version_server(supported).await;
+        let gateway = Gateway::start(json!({ "strict": { "url": url } }), &[]).await;
+        gateway.wait_for_status("strict", status).await;
+        drop(gateway);
+        let mut versions = Vec::new();
+        while let Ok(version) = requested.try_recv() {
+            versions.push(version);
+        }
+        // A failed server is retried in the background, each attempt making the same request
+        versions.dedup();
+        assert_eq!(versions, expected, "{supported:?}");
+    }
+}
