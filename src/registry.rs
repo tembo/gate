@@ -12,7 +12,8 @@ use rmcp::{
     RoleClient, ServiceError, ServiceExt,
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
-        ClientConfig, ClientRequest, Implementation, JsonObject, ServerResult, Tool,
+        ClientConfig, ClientRequest, ErrorCode, Implementation, JsonObject, ProtocolVersion,
+        ServerResult, Tool,
     },
     service::{Peer, PeerRequestOptions, RunningService},
     transport::{
@@ -967,11 +968,55 @@ async fn wait_until(time: Option<chrono::DateTime<chrono::Utc>>) {
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
+/// Connects with the newest protocol version that has an `initialize` handshake. A server that
+/// rejects it but lists the versions it supports is retried once with the newest of those.
 async fn connect(
     id: &str,
     transport: &Transport,
     redactor: crate::redaction::Redactor,
     auth: Arc<crate::credential_http::AuthResponses>,
+) -> Result<(Client, Vec<Tool>)> {
+    let preferred = ProtocolVersion::LATEST_WITH_INITIALIZE;
+    let result = connect_with(id, transport, redactor.clone(), auth.clone(), &preferred).await;
+    match result
+        .as_ref()
+        .err()
+        .and_then(|error| fallback_version(error, &preferred))
+    {
+        Some(version) => connect_with(id, transport, redactor, auth, &version).await,
+        None => result,
+    }
+}
+
+/// The newest version, other than `attempted`, that an `UNSUPPORTED_PROTOCOL_VERSION`
+/// rejection lists as supported and that gate can speak over `initialize`
+fn fallback_version(error: &anyhow::Error, attempted: &ProtocolVersion) -> Option<ProtocolVersion> {
+    use rmcp::service::ClientInitializeError;
+    let supported = error.chain().find_map(|cause| {
+        let Some(ClientInitializeError::JsonRpcError(data)) = cause.downcast_ref() else {
+            return None;
+        };
+        if data.code != ErrorCode::UNSUPPORTED_PROTOCOL_VERSION {
+            return None;
+        }
+        let supported = data.data.as_ref()?.get("supported")?.clone();
+        serde_json::from_value::<Vec<ProtocolVersion>>(supported).ok()
+    })?;
+    ProtocolVersion::KNOWN_VERSIONS
+        .iter()
+        .rev()
+        .find(|version| {
+            version.has_initialize() && *version != attempted && supported.contains(version)
+        })
+        .cloned()
+}
+
+async fn connect_with(
+    id: &str,
+    transport: &Transport,
+    redactor: crate::redaction::Redactor,
+    auth: Arc<crate::credential_http::AuthResponses>,
+    version: &ProtocolVersion,
 ) -> Result<(Client, Vec<Tool>)> {
     match transport {
         Transport::Stdio {
@@ -994,8 +1039,10 @@ async fn connect(
             let stderr =
                 stderr.map(|stderr| tokio::spawn(forward_stderr(id.to_owned(), stderr, redactor)));
 
-            match handshake(child).await {
+            match handshake(child, version).await {
                 Ok(connected) => Ok(connected),
+                // `connect` retries these with another version, so it needs the original error
+                Err(error) if fallback_version(&error, version).is_some() => Err(error),
                 Err(error) => {
                     // The child is killed once the handshake fails, so its stderr ends shortly.
                     // Its last lines usually explain the failure.
@@ -1041,23 +1088,26 @@ async fn connect(
                 config.channel_buffer_capacity = HTTP_CONCURRENT_REQUESTS;
                 config
             };
-            handshake(StreamableHttpClientTransport::with_client(
-                crate::credential_http::HttpClient::new(auth, proxy.as_deref())?,
-                config,
-            ))
+            handshake(
+                StreamableHttpClientTransport::with_client(
+                    crate::credential_http::HttpClient::new(auth, proxy.as_deref())?,
+                    config,
+                ),
+                version,
+            )
             .await
         }
     }
 }
 
 /// Initializes the session and fetches every page of the server's tools
-async fn handshake<T, E, A>(transport: T) -> Result<(Client, Vec<Tool>)>
+async fn handshake<T, E, A>(transport: T, version: &ProtocolVersion) -> Result<(Client, Vec<Tool>)>
 where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
     let attempt = async {
-        let mut client = client_config()
+        let mut client = client_config(version)
             .serve(transport)
             .await
             .context("failed to initialize")?;
@@ -1105,9 +1155,10 @@ fn redact_urls(message: &str) -> String {
     redacted
 }
 
-fn client_config() -> ClientConfig {
+fn client_config(version: &ProtocolVersion) -> ClientConfig {
     let mut info = ClientConfig::default();
     info.client_info = Implementation::new("gate", env!("CARGO_PKG_VERSION"));
+    info.protocol_version = version.clone();
     info
 }
 
