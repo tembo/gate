@@ -530,6 +530,25 @@ fn echo(url: &str) -> Value {
 const TOKEN: (&str, &str) = ("TOKEN", "test-token");
 
 #[tokio::test]
+async fn ignores_headers_the_transport_sets_itself() {
+    let url = serve_echo().await.url;
+    let gateway = Gateway::start(
+        json!({ "echo": { "url": url, "headers": {
+            // Copied from curl examples; the TypeScript SDK overwrote these
+            "ACCEPT": "application/json",
+            "Mcp-Session-Id": "stale",
+            "Last-Event-ID": "1",
+            // Other headers still reach the server, which requires this one
+            "Authorization": "Bearer ${TOKEN}",
+        } } }),
+        &[TOKEN],
+    )
+    .await;
+    let echo = gateway.wait_for_status("echo", "ready").await;
+    assert_eq!(echo["toolCount"], 8);
+}
+
+#[tokio::test]
 async fn discovers_http_tools_with_headers() {
     let url = serve_echo().await.url;
     let gateway = Gateway::start(

@@ -209,6 +209,13 @@ impl Registry {
             .servers
             .iter()
             .map(|(id, server)| {
+                if let Ok(Transport::Http { headers, .. }) = &server.transport {
+                    for name in headers.keys().filter(|name| ignored_header(name)) {
+                        eprintln!(
+                            "[gate] ignoring header `{name}` of `{id}`, which gate sets itself"
+                        );
+                    }
+                }
                 let (retry, retries) = mpsc::unbounded_channel();
                 let transport = match &server.transport {
                     Ok(transport) => transport,
@@ -1071,6 +1078,7 @@ async fn connect_with(
         } => {
             let custom_headers = headers
                 .iter()
+                .filter(|(name, _)| !ignored_header(name))
                 .map(|(name, value)| {
                     // Header values may hold secrets, so errors only name the header
                     let parsed = (HeaderName::try_from(name), HeaderValue::try_from(value));
@@ -1098,6 +1106,16 @@ async fn connect_with(
             .await
         }
     }
+}
+
+/// Headers the HTTP transport sets itself. rmcp rejects a server's own, which would fail the
+/// server, while the TypeScript SDK overwrote them, so gate ignores them the same way.
+const IGNORED_HEADERS: &[&str] = &["accept", "mcp-session-id", "last-event-id"];
+
+fn ignored_header(name: &str) -> bool {
+    IGNORED_HEADERS
+        .iter()
+        .any(|ignored| name.eq_ignore_ascii_case(ignored))
 }
 
 /// Initializes the session and fetches every page of the server's tools
